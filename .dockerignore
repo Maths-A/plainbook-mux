@@ -1,0 +1,7 @@
+__pycache__
+*.pyc
+runtime
+template
+.venv
+.git
+.DS_Store
