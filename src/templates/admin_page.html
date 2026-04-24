@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Plainbook Mux</title>
+  <link rel="stylesheet" href="/static/css/admin.css">
+  <script src="/static/js/admin.js" defer></script>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <div class="panel hero-copy">
+        <div class="eyebrow">Bottle launcher</div>
+        <h1>Plainbook Mux</h1>
+        <p class="lede">
+          Start a fresh plainbook instance every time you click Start. Each launch gets its own notebook file,
+          process, and front-end URL.
+        </p>
+        <div class="stats">
+          <div class="stat"><strong id="stat-total">0</strong><span>Total launches</span></div>
+          <div class="stat"><strong id="stat-running">0</strong><span>Running now</span></div>
+        </div>
+      </div>
+      <div class="panel hero-actions">
+        <div class="launch-card">
+          <p>
+            This admin dashboard shows all launched sessions and lets you open or stop each process.
+          </p>
+          <div class="button-row">
+            <button class="secondary" onclick="refreshSessions()">Refresh</button>
+            <button class="secondary" type="button" onclick="openAccessCodeModal()">Manage access codes</button>
+            <a class="secondary" href="/admin/logout" style="text-decoration:none;display:inline-flex;align-items:center;">Logout</a>
+          </div>
+        </div>
+        <div>
+          <div class="code" id="launch-command">Latest launch: none</div>
+          <div class="code" id="system-usage" style="margin-top:8px;">Mux usage: loading...</div>
+          <div class="code" id="total-usage" style="margin-top:8px;">Total usage: loading...</div>
+          <div class="code" id="runtime-size" style="margin-top:8px; display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap;">
+            <span id="runtime-size-text">Runtime folder size: loading...</span>
+            <button class="secondary" id="delete-runtime-btn" onclick="deleteRuntimeFiles()">Delete runtime files</button>
+          </div>
+          <div class="footnote">Instances are tracked in memory while this launcher process is running.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top: 20px; padding: 20px; display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap;">
+      <div>
+        <h2 style="margin:0 0 6px;">Access Codes</h2>
+        <p id="access-codes-status" style="margin:0; color: var(--muted);">Manage study templates and generate participant-specific access codes.</p>
+      </div>
+      <button class="primary" type="button" onclick="openAccessCodeModal()">Open editor</button>
+    </section>
+
+    <section class="panel list-panel">
+      <div class="list-header">
+        <div>
+          <h2>Instances</h2>
+          <p>Each row points to a separate plainbook process and notebook file.</p>
+        </div>
+        <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+          <button class="secondary" id="stop-all-btn" onclick="stopAllInstances()">Stop all</button>
+          <p id="last-refresh">Not refreshed yet</p>
+        </div>
+      </div>
+      <div id="cards" class="cards"></div>
+    </section>
+  </div>
+  <dialog id="access-codes-modal" class="modal-backdrop" aria-modal="true">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Access Code Management</h3>
+        <button class="secondary" type="button" onclick="closeAccessCodeModal()">Close</button>
+      </div>
+      <div class="tab-bar">
+        <button type="button" class="tab-btn active" id="tab-btn-study" onclick="switchAccessModalTab('study')">Study Templates</button>
+        <button type="button" class="tab-btn" id="tab-btn-generated" onclick="switchAccessModalTab('generated')">Generated Codes</button>
+      </div>
+
+      <div id="tab-panel-study" class="tab-panel active">
+        <p class="footnote" style="margin: 0 0 10px;">Manage user-study codes and their template locations.</p>
+        <div id="access-codes-error" class="footnote" style="margin: 0 0 10px;"></div>
+        <table class="rows-table">
+          <thead>
+            <tr>
+              <th style="width:30%;">Study code</th>
+              <th>Template location</th>
+              <th style="width:100px;">Action</th>
+            </tr>
+          </thead>
+          <tbody id="access-code-rows"></tbody>
+        </table>
+        <div class="modal-actions">
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="ghost" type="button" onclick="addAccessCodeRow()">Add row</button>
+            <button class="secondary" type="button" onclick="reloadAccessCodeRows()">Reload</button>
+          </div>
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="secondary" type="button" onclick="closeAccessCodeModal()">Cancel</button>
+            <button class="primary" type="button" id="save-access-codes-btn" onclick="saveAccessCodes()">Save</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="tab-panel-generated" class="tab-panel">
+        <p class="footnote" style="margin: 0 0 10px;">Generate unique participant codes and map each one to a study template.</p>
+        <div id="generated-codes-error" class="footnote" style="margin: 0 0 10px;"></div>
+        <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin-bottom: 12px;">
+          <label style="margin:0; min-width:200px;">
+            Study code
+            <select id="generated-study-select" style="width:100%; border:1px solid rgba(255,255,255,0.16); border-radius:10px; background:rgba(255,255,255,0.04); color:var(--text); padding:8px 10px; font:inherit;"></select>
+          </label>
+          <label style="margin:0; min-width:110px;">
+            Count
+            <input id="generated-count" type="number" min="1" max="100" value="1" style="width:100%; border:1px solid rgba(255,255,255,0.16); border-radius:10px; background:rgba(255,255,255,0.04); color:var(--text); padding:8px 10px; font:inherit;">
+          </label>
+          <button class="primary" type="button" id="generate-codes-btn" onclick="generateCodes()">Generate</button>
+          <button class="secondary" type="button" onclick="reloadGeneratedCodes()">Reload</button>
+          <button class="secondary" type="button" onclick="exportGeneratedCodesCsv()">Export CSV</button>
+        </div>
+        <div id="generated-study-stats" class="footnote" style="margin: 0 0 12px;"></div>
+
+        <table class="rows-table">
+          <thead>
+            <tr>
+              <th style="width:24%;">Generated code</th>
+              <th style="width:24%;">Study code</th>
+              <th style="width:10%;">Given</th>
+              <th style="width:12%;">Used</th>
+              <th>Created</th>
+              <th style="width:180px;">Action</th>
+            </tr>
+          </thead>
+          <tbody id="generated-code-rows"></tbody>
+        </table>
+        <div class="modal-actions">
+          <div></div>
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="secondary" type="button" onclick="closeAccessCodeModal()">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="toast" class="toast"></div>
+</body>
+</html>

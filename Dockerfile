@@ -25,11 +25,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 RUN chmod 750 /app \
-    && mkdir -p runtime \
-    && mkdir -p template
+    && mkdir -p src/runtime \
+    && mkdir -p src/template
 
 USER root
 
 EXPOSE 5050
 
-CMD ["python", "app.py"]
+CMD ["python", "src/app.py"]

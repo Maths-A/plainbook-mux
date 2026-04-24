@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin Login</title>
+  <link rel="stylesheet" href="/static/css/admin_login.css">
+</head>
+<body>
+  <form method="post" action="/admin/login">
+    <h1>Admin Login</h1>
+    <p>Enter the admin password to access the session dashboard.</p>
+    <div class="error">__ERROR__</div>
+    <input type="password" name="password" placeholder="Admin password" required autofocus>
+    <button type="submit">Sign in</button>
+  </form>
+</body>
+</html>

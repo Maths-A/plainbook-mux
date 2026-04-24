@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Launch Plainbook</title>
+  <link rel="stylesheet" href="/static/css/user.css">
+  <script src="/static/js/user.js" defer></script>
+</head>
+<body>
+  <main class="card">
+    <h1>Plainbook Launch</h1>
+    <p>Enter your code and start a new plainbook instance.</p>
+    <label for="launch-code">Access code</label>
+    <input id="launch-code" type="text" placeholder="ex: team-alpha" autocomplete="off">
+    <div class="row">
+      <button class="primary" id="start-btn" type="button" onclick="launchPlainbook()">Start Plainbook</button>
+    </div>
+    <div class="status" id="status">Ready.</div>
+  </main>
+</body>
+</html>
