@@ -108,6 +108,11 @@ def read_env_int(name: str, default: int, min_value: int = 1) -> int:
   return max(value, min_value)
 
 
+# Concurrency limit for Cloud Run provisioning to avoid overloading the control plane
+CLOUD_RUN_PROVISION_CONCURRENCY = read_env_int("PLAINBOOK_CLOUD_RUN_PROVISION_CONCURRENCY", 4)
+_CLOUD_RUN_PROVISION_SEMAPHORE = threading.Semaphore(CLOUD_RUN_PROVISION_CONCURRENCY)
+
+
 ISOLATION_ENABLED = os.environ.get("PLAINBOOK_ENABLE_ISOLATION", "true").lower() in {"1", "true", "yes"}
 MACOS_SANDBOX_ENABLED = os.environ.get("PLAINBOOK_USE_SANDBOX_EXEC", "true").lower() in {"1", "true", "yes"}
 LINUX_BWRAP_ENABLED = os.environ.get("PLAINBOOK_USE_BWRAP", "false").lower() in {"1", "true", "yes"}
@@ -243,6 +248,7 @@ def build_instance_env(
   tmp_dir: Path,
   study_code: str | None = None,
   launch_code: str | None = None,
+  mux_url: str | None = None,
 ) -> dict[str, str]:
     guard_code = build_kernel_fs_guard(instance_dir, strict_mode=KERNEL_STRICT_MODE)
 
@@ -277,6 +283,8 @@ def build_instance_env(
         env["GCS_STUDY_BUCKET"] = GCS_STUDY_BUCKET
       if PLAINBOOK_UPLOAD_KEY_JSON:
         env["PLAINBOOK_UPLOAD_KEY_JSON"] = PLAINBOOK_UPLOAD_KEY_JSON
+    if mux_url:
+      env["PLAINBOOK_MUX_URL"] = mux_url
     return env
 
 
@@ -578,6 +586,7 @@ def build_container_env(
   study_code: str | None = None,
   launch_code: str | None = None,
   auth_token: str | None = None,
+  mux_url: str | None = None,
 ) -> dict[str, str]:
     submission_key = (launch_code or "").strip() or instance_id
     env = {
@@ -601,6 +610,8 @@ def build_container_env(
         env["PLAINBOOK_UPLOAD_KEY_JSON"] = PLAINBOOK_UPLOAD_KEY_JSON
     if auth_token:
       env["PLAINBOOK_INSTANCE_AUTH_TOKEN"] = auth_token
+    if mux_url:
+      env["PLAINBOOK_MUX_URL"] = mux_url
     return env
 
 
@@ -611,15 +622,17 @@ def require_instance_container_image() -> str:
 
 
 def _request_url_is_ready(target_url: str, timeout_seconds: int = 2) -> bool:
-    request_obj = Request(target_url, method="GET")
-    try:
-        with urlopen(request_obj, timeout=timeout_seconds) as upstream:
-            return 200 <= upstream.getcode() < 500
-    except URLLibHTTPError as exc:
-        # A 404 typically means the instance endpoint is gone.
-        return exc.code < 500 and exc.code != 404
-    except Exception:
-        return False
+  request_obj = Request(target_url, method="GET")
+  # Mark this request as a mux probe so instances can ignore it for "last activity" updates
+  request_obj.add_header("X-Plainbook-Probe", "1")
+  try:
+    with urlopen(request_obj, timeout=timeout_seconds) as upstream:
+      return 200 <= upstream.getcode() < 500
+  except URLLibHTTPError as exc:
+    # A 404 typically means the instance endpoint is gone.
+    return exc.code < 500 and exc.code != 404
+  except Exception:
+    return False
 
 
 def _build_instance_healthcheck_url(record: "InstanceRecord") -> str:
@@ -670,6 +683,7 @@ def build_cloud_run_service_body(
     template_location: str | None = None,
     study_code: str | None = None,
     launch_code: str | None = None,
+  mux_url: str | None = None,
 ) -> dict:
     image = require_instance_container_image()
     env_items = [
@@ -680,6 +694,7 @@ def build_cloud_run_service_body(
             study_code=study_code,
           launch_code=launch_code,
             auth_token=auth_token,
+            mux_url=mux_url,
         ).items()
     ]
     _, project_id = _cloud_run_session_and_project()
@@ -722,6 +737,7 @@ def build_docker_run_command(
     study_code: str | None = None,
   launch_code: str | None = None,
     auth_token: str | None = None,
+    mux_url: str | None = None,
 ) -> tuple[list[str], str, int]:
     image = require_instance_container_image()
     host_port = find_free_port()
@@ -732,6 +748,7 @@ def build_docker_run_command(
         study_code=study_code,
       launch_code=launch_code,
         auth_token=auth_token,
+        mux_url=mux_url,
     )
     cmd = [
         "docker",
@@ -921,6 +938,29 @@ def wait_for_backend_ready(target_url: str, timeout_seconds: int) -> bool:
             return True
         time.sleep(1)
     return False
+
+
+def _smoke_test_report_activity(record: "InstanceRecord") -> bool:
+  """Send one startup activity ping to verify the instance exposes /report_activity."""
+  target_url = _build_instance_healthcheck_url(record)
+  if not target_url:
+    return False
+  try:
+    parsed = urlsplit(target_url)
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    if record.token and not any(key == "token" for key, _ in query_items):
+      query_items.append(("token", record.token))
+    activity_url = urlunsplit((parsed.scheme, parsed.netloc, "/report_activity", urlencode(query_items), ""))
+    request_obj = Request(activity_url, method="POST")
+    request_obj.add_header("Content-Type", JSON_CONTENT_TYPE)
+    with urlopen(request_obj, data=b"{}", timeout=5) as upstream:
+      if 200 <= upstream.getcode() < 300:
+        return True
+  except URLLibHTTPError as exc:
+    print(f"[plainbook-mux] Activity smoke test failed for {record.id}: HTTP {exc.code}")
+  except Exception as exc:
+    print(f"[plainbook-mux] Activity smoke test failed for {record.id}: {exc}")
+  return False
 
 
 def build_isolated_command(base_cmd: list[str], sandbox_profile_path: Path, instance_dir: Path, tmp_dir: Path) -> tuple[list[str], str | None]:
@@ -1214,8 +1254,39 @@ def read_template_source(template_location: str) -> str:
     if parsed_location.scheme in {"http", "https"}:
         return fetch_text_from_url(location)
     if parsed_location.scheme == "gs":
-        if not parsed_location.netloc or not parsed_location.path:
-            raise FileNotFoundError(f"Invalid Google Cloud Storage location: {location}")
+      if not parsed_location.netloc or not parsed_location.path:
+        raise FileNotFoundError(f"Invalid Google Cloud Storage location: {location}")
+      bucket = parsed_location.netloc
+      path = parsed_location.path.lstrip("/")
+      # Try GCS client first (supports private buckets when credentials are provided),
+      # fall back to public HTTPS URL otherwise.
+      try:
+        try:
+          from google.cloud import storage
+          from google.oauth2 import service_account
+        except Exception:
+          storage = None
+        if storage:
+          if PLAINBOOK_UPLOAD_KEY_JSON:
+            creds_info = json.loads(PLAINBOOK_UPLOAD_KEY_JSON)
+            creds = service_account.Credentials.from_service_account_info(creds_info)
+            client = storage.Client(credentials=creds, project=creds.project_id)
+          else:
+            client = storage.Client()
+          bucket_obj = client.bucket(bucket)
+          blob = bucket_obj.blob(path)
+          if not blob.exists():
+            raise FileNotFoundError(f"Template not found in GCS: {location}")
+          data = blob.download_as_bytes()
+          # attempt to decode using utf-8, fallback to latin-1
+          try:
+            return data.decode("utf-8")
+          except Exception:
+            return data.decode("latin-1")
+      except FileNotFoundError:
+        raise
+      except Exception:
+        # Fall back to public HTTPS URL if GCS client isn't available or fails.
         gcs_url = f"https://storage.googleapis.com/{parsed_location.netloc}{parsed_location.path}"
         return fetch_text_from_url(gcs_url)
     if parsed_location.scheme == "file":
@@ -1272,6 +1343,7 @@ class InstanceRecord:
     backend_kind: str = "process"
     backend_ref: str | None = None
     backend_url: str | None = None
+    last_activity: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:
         usage = get_process_usage(self.process.pid) if self.process is not None else None
@@ -1294,6 +1366,7 @@ class InstanceRecord:
             "backend_kind": self.backend_kind,
             "backend_ref": self.backend_ref,
             "backend_url": self.backend_url,
+            "last_activity": self.last_activity,
             "usage": usage,
         }
 
@@ -1304,6 +1377,11 @@ class PlainbookLauncher:
     self._instances: dict[str, InstanceRecord] = {}
     self._container_tokens_cache: dict[str, str] = {}  # Maps instance_id to token for containers
     self._recently_stopped_launch_codes: dict[str, float] = {}
+    # Idle stop configuration
+    self._idle_timeout_seconds = read_env_int("PLAINBOOK_IDLE_TIMEOUT_SECONDS", 3600, min_value=60)
+    self._idle_check_interval = read_env_int("PLAINBOOK_IDLE_CHECK_INTERVAL_SECONDS", 60, min_value=10)
+    self._idle_thread = threading.Thread(target=self._idle_stop_loop, daemon=True)
+    self._idle_thread.start()
 
   def _prune_recently_stopped_launch_codes_locked(self) -> None:
     now = time.time()
@@ -1360,6 +1438,26 @@ class PlainbookLauncher:
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
 
+  def _idle_stop_loop(self) -> None:
+    while True:
+      try:
+        self._run_idle_check_once()
+      except Exception:
+        pass
+      time.sleep(self._idle_check_interval)
+
+  def _run_idle_check_once(self) -> None:
+    now = time.time()
+    with self._lock:
+      candidates = [r for r in list(self._instances.values()) if self._record_is_running(r)]
+    for record in candidates:
+      last = getattr(record, "last_activity", record.created_at)
+      if now - last > self._idle_timeout_seconds:
+        try:
+          self.stop(record.id)
+        except Exception:
+          pass
+
   def _apply_instance_permissions(self, instance_dir: Path, tmp_dir: Path, notebook_path: Path) -> None:
     if INSTANCE_UID is None or INSTANCE_GID is None or os.geteuid() != 0:
       return
@@ -1386,6 +1484,7 @@ class PlainbookLauncher:
       template_location: str | None = None,
       study_code: str | None = None,
       launch_code: str | None = None,
+      mux_url: str | None = None,
   ) -> tuple[str, str, int]:
     container_token = build_instance_auth_token(instance_id)
     cmd, container_name, host_port = build_docker_run_command(
@@ -1395,6 +1494,7 @@ class PlainbookLauncher:
         study_code=study_code,
       launch_code=launch_code,
         auth_token=container_token,
+        mux_url=mux_url,
     )
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if result.returncode != 0:
@@ -1413,6 +1513,7 @@ class PlainbookLauncher:
       template_location: str | None = None,
       study_code: str | None = None,
       launch_code: str | None = None,
+      mux_url: str | None = None,
   ) -> tuple[str, str]:
     service_name = build_cloud_run_service_name(instance_id)
     session, project_id = _cloud_run_session_and_project()
@@ -1427,6 +1528,7 @@ class PlainbookLauncher:
       template_location=template_location,
       study_code=study_code,
       launch_code=launch_code,
+      mux_url=mux_url,
     )
     result = session.post(api_url, json=payload, timeout=120)
     if result.status_code >= 400:
@@ -1438,7 +1540,7 @@ class PlainbookLauncher:
       self._container_tokens_cache[instance_id] = container_token
     return service_name, service_url
 
-  def start(self, launch_code: str | None = None, template_code: str | None = None) -> InstanceRecord:
+  def start(self, launch_code: str | None = None, template_code: str | None = None, mux_url: str | None = None) -> InstanceRecord:
     if launch_code:
       existing = self.find_running_instance_by_launch_code(launch_code)
       if existing is not None:
@@ -1465,6 +1567,7 @@ class PlainbookLauncher:
         template_location=template_location,
         study_code=study_code,
         launch_code=launch_code,
+        mux_url=mux_url,
       )
       record = InstanceRecord(
         id=instance_id,
@@ -1485,33 +1588,28 @@ class PlainbookLauncher:
         if cached_token:
           record.token = cached_token
     elif INSTANCE_BACKEND == "cloud-run":
-      backend_ref, backend_url = self._start_cloud_run_instance(
-        instance_id,
-        notebook_path,
-        template_location=template_location,
-        study_code=study_code,
-        launch_code=launch_code,
-      )
+      # Provision Cloud Run service asynchronously to avoid blocking concurrent launches.
+      service_name = build_cloud_run_service_name(instance_id)
       record = InstanceRecord(
         id=instance_id,
         notebook_path=notebook_path,
         launch_code=launch_code,
           study_code=study_code,
         instance_dir=instance_dir,
-        public_url=backend_url,
-        status="running",
+        public_url=None,
+        status="starting",
         backend_kind="cloud-run",
-        backend_ref=backend_ref,
-        backend_url=backend_url,
+        backend_ref=service_name,
+        backend_url=None,
       )
-      # Set the cached token for container backends
+      # Generate and cache the per-instance token immediately so lookups and
+      # callbacks can authenticate even while provisioning proceeds.
+      container_token = build_instance_auth_token(instance_id)
       with self._lock:
-        cached_token = self._container_tokens_cache.get(instance_id)
-        if cached_token:
-          record.token = cached_token
+        self._container_tokens_cache[instance_id] = container_token
     else:
       port = find_free_port()
-      env = build_instance_env(instance_dir, tmp_dir, study_code=study_code, launch_code=launch_code)
+      env = build_instance_env(instance_dir, tmp_dir, study_code=study_code, launch_code=launch_code, mux_url=mux_url)
       self._apply_instance_permissions(instance_dir, tmp_dir, notebook_path)
 
       if ISOLATION_ENABLED and sys.platform == "darwin" and MACOS_SANDBOX_ENABLED and shutil.which("sandbox-exec"):
@@ -1565,13 +1663,89 @@ class PlainbookLauncher:
           record.status = "exited"
       return record
 
-    wait_seconds = 60 if record.backend_kind == "cloud-run" else 20
-    if wait_for_backend_ready(record.backend_url or "", wait_seconds):
-      with self._lock:
-        record.status = "running"
-    else:
-      with self._lock:
-        record.status = "starting"
+    # For docker backend: finalize readiness in background.
+    if record.backend_kind == "docker":
+      def _finalize_backend_launch() -> None:
+        try:
+          wait_seconds = 20
+          if wait_for_backend_ready(record.backend_url or "", wait_seconds):
+            with self._lock:
+              record.status = "running"
+            _smoke_test_report_activity(record)
+          else:
+            with self._lock:
+              record.status = "starting"
+        except Exception as exc:
+          print(f"[plainbook-mux] Background finalization failed for {record.id}: {exc}")
+
+      bg_thread = threading.Thread(target=_finalize_backend_launch, daemon=True)
+      bg_thread.start()
+
+    # For cloud-run: start asynchronous provisioning task so start() returns quickly
+    if record.backend_kind == "cloud-run":
+      def _async_provision_cloud_run() -> None:
+        acquired = False
+        try:
+          # throttle concurrent provisioning to avoid overwhelming Cloud Run
+          acquired = _CLOUD_RUN_PROVISION_SEMAPHORE.acquire(timeout=600)
+          if not acquired:
+            raise RuntimeError("Timed out acquiring Cloud Run provision slot")
+
+          # retry provisioning a few times with backoff for transient control-plane errors
+          attempts = 3
+          backoff = 1.0
+          last_exc: Exception | None = None
+          for attempt in range(1, attempts + 1):
+            try:
+              backend_ref, service_url = self._start_cloud_run_instance(
+                instance_id,
+                notebook_path,
+                template_location=template_location,
+                study_code=study_code,
+                launch_code=launch_code,
+                mux_url=mux_url,
+              )
+              last_exc = None
+              break
+            except Exception as exc:
+              last_exc = exc
+              print(f"[plainbook-mux] Cloud Run provision attempt {attempt} failed for {instance_id}: {exc}")
+              time.sleep(backoff)
+              backoff *= 2
+
+          if last_exc is not None:
+            raise last_exc
+
+          with self._lock:
+            cached_token = self._container_tokens_cache.get(instance_id)
+            if cached_token:
+              record.token = cached_token
+            record.backend_ref = backend_ref
+            record.backend_url = service_url
+            record.public_url = service_url
+            record.status = "running"
+
+          _smoke_test_report_activity(record)
+
+        except Exception as exc:
+          with self._lock:
+            record.last_output += f"\nCloud Run provision failed: {exc}"
+            # mark failed but keep record for debugging/inspection
+            record.status = "exited"
+          print(f"[plainbook-mux] Cloud Run provisioning failed for {record.id}: {exc}")
+        finally:
+          try:
+            if acquired:
+              _CLOUD_RUN_PROVISION_SEMAPHORE.release()
+          except Exception:
+            pass
+
+      prov_thread = threading.Thread(target=_async_provision_cloud_run, daemon=True)
+      prov_thread.start()
+    
+    # Return immediately with "starting" status
+    with self._lock:
+      record.status = "starting"
     return record
 
   def list_instances(self) -> list[dict]:
@@ -1964,7 +2138,10 @@ def launch_instance_from_request() -> dict:
     mark_generated_code_used(code)
 
   try:
-    record = launcher.start(launch_code=code, template_code=resolved_study_code)
+    mux_url = f"{request.urlparts.scheme}://{request.urlparts.netloc}"
+    record = launcher.start(launch_code=code, template_code=resolved_study_code, mux_url=mux_url)
+    # Return immediately without blocking; provisioning happens in background.
+    # Client should poll /api/sessions to check when public_url becomes available.
   except FileNotFoundError as exc:
     if "template" in str(exc).lower():
       response.status = 400
@@ -1981,6 +2158,22 @@ def launch_instance_from_request() -> dict:
 @app.post("/api/launch")
 def public_launch():
   return launch_instance_from_request()
+
+
+@app.get("/api/instance-status/<instance_id>")
+def get_instance_status(instance_id):
+  """Public endpoint to check instance provisioning status.
+  
+  Used by launcher UI to poll for when an instance is ready to open.
+  Returns instance details including public_url when available.
+  """
+  response.content_type = JSON_CONTENT_TYPE
+  instances = launcher.list_instances()
+  for instance in instances:
+    if instance.get("id") == instance_id:
+      return instance
+  response.status = 404
+  return {"error": "Instance not found"}
 
 
 @app.get("/api/admin/access-codes")
@@ -2023,6 +2216,55 @@ def admin_study_codes_get():
     })
   response.content_type = JSON_CONTENT_TYPE
   return {"studies": studies}
+
+
+@app.post("/api/admin/templates/upload")
+@require_admin
+def admin_templates_upload():
+  # Accepts multipart/form-data with field 'file'. Uploads to
+  # gs://<GCS_STUDY_BUCKET>/plainbook/user-studies/templates/<filename>
+  upload = None
+  try:
+    upload = request.files.get('file')
+  except Exception:
+    upload = None
+
+  if not upload:
+    raise HTTPError(400, "Missing file upload (form field 'file')")
+
+  if not GCS_STUDY_BUCKET:
+    raise HTTPError(400, "GCS study bucket not configured on server")
+
+  # sanitize filename
+  filename = (upload.filename or 'template').strip()
+  safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
+  dest_path = f"plainbook/user-studies/templates/{safe_name}"
+
+  try:
+    try:
+      from google.cloud import storage
+      from google.oauth2 import service_account
+    except Exception as exc:  # pragma: no cover - runtime dependency
+      raise HTTPError(500, f"GCS client not available: {exc}")
+
+    if PLAINBOOK_UPLOAD_KEY_JSON:
+      creds_info = json.loads(PLAINBOOK_UPLOAD_KEY_JSON)
+      creds = service_account.Credentials.from_service_account_info(creds_info)
+      client = storage.Client(credentials=creds, project=creds.project_id)
+    else:
+      client = storage.Client()
+
+    bucket = client.bucket(GCS_STUDY_BUCKET)
+    blob = bucket.blob(dest_path)
+    # upload.file is a file-like object
+    blob.upload_from_file(upload.file, content_type=(upload.content_type or 'application/octet-stream'))
+  except HTTPError:
+    raise
+  except Exception as exc:
+    raise HTTPError(500, f"Upload failed: {exc}") from exc
+
+  response.content_type = JSON_CONTENT_TYPE
+  return {"status": "ok", "location": f"gs://{GCS_STUDY_BUCKET}/{dest_path}", "name": safe_name}
 
 
 @app.get("/api/admin/generated-codes")
@@ -2118,6 +2360,67 @@ def admin_generated_codes_update_study():
   return {"status": "ok"}
 
 
+
+@app.post("/api/sessions/<instance_id>/activity")
+def session_activity(instance_id: str):
+  """Instance calls this endpoint to report real user activity.
+
+  The instance should send `Authorization: Bearer <token>` where `<token>` is the instance token
+  printed by the instance and stored in the `InstanceRecord.token` field. If an instance has no
+  token yet, the activity ping is accepted (useful during startup).
+  """
+  auth = request.get_header("Authorization") or ""
+  bearer = None
+  if auth.startswith("Bearer "):
+    bearer = auth.split(" ", 1)[1].strip()
+
+  with launcher._lock:
+    # Direct id match
+    record = launcher._instances.get(instance_id)
+    # Fallbacks: backend_ref exact, launch_code exact, backend_ref contains, backend_url host/path match
+    if not record:
+      for r in launcher._instances.values():
+        try:
+          if r.backend_ref == instance_id:
+            record = r
+            break
+          if r.launch_code and r.launch_code == instance_id:
+            record = r
+            break
+          if r.backend_ref and instance_id in r.backend_ref:
+            record = r
+            break
+          # match by backend_url host or path suffix
+          if r.backend_url and instance_id in (r.backend_url or ""):
+            record = r
+            break
+        except Exception:
+          continue
+    if not record:
+      # As a final fallback, the instance may have forwarded using its auth token
+      if bearer:
+        token_match = launcher.find_running_instance_by_token(bearer)
+        if token_match is not None:
+          record = token_match
+    if not record:
+      raise HTTPError(404, "Instance not found")
+
+    # Accept when token matches, or when record has no token yet.
+    if record.token:
+      if bearer and bearer == record.token:
+        record.last_activity = time.time()
+        response.content_type = JSON_CONTENT_TYPE
+        return {"updated": True}
+      # Log mismatch for easier debugging
+      print(f"[plainbook-mux] Invalid activity auth for instance {instance_id}; expected token set on record {record.id}")
+      raise HTTPError(403, "Invalid auth token for activity ping")
+
+    # record has no token yet: accept the ping and set last_activity
+    record.last_activity = time.time()
+    response.content_type = JSON_CONTENT_TYPE
+    return {"updated": True}
+
+
 @app.post("/api/admin/generated-codes/update-given")
 @require_admin
 def admin_generated_codes_update_given():
@@ -2209,7 +2512,7 @@ def admin_logout():
 
 @app.get("/static/<filepath:path>")
 def serve_static(filepath: str):
-  return static_file(filepath, root=str(FRONTEND_STATIC_DIR))
+   return static_file(filepath, root=str(FRONTEND_STATIC_DIR))
 
 
 def build_instance_proxy_target(record: InstanceRecord, subpath: str, raw_query: str) -> str:

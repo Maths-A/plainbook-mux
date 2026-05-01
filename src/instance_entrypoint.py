@@ -4,9 +4,12 @@ import base64
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import urlopen
+
+JSON_CONTENT_TYPE = "application/json"
 
 
 def read_template_source(template_location: str) -> str:
@@ -23,6 +26,31 @@ def read_template_source(template_location: str) -> str:
     if parsed_location.scheme == "gs":
         if not parsed_location.netloc or not parsed_location.path:
             raise RuntimeError(f"Invalid Google Cloud Storage location: {location}")
+        bucket_name = parsed_location.netloc
+        object_path = parsed_location.path.lstrip("/")
+        try:
+            from google.cloud import storage
+        except Exception:
+            storage = None
+
+        if storage is not None:
+            key_json = os.environ.get("PLAINBOOK_UPLOAD_KEY_JSON", "").strip()
+            try:
+                if key_json:
+                    from google.oauth2 import service_account
+
+                    credentials_info = json.loads(key_json)
+                    credentials = service_account.Credentials.from_service_account_info(credentials_info)
+                    client = storage.Client(credentials=credentials, project=credentials.project_id)
+                else:
+                    client = storage.Client()
+                blob = client.bucket(bucket_name).blob(object_path)
+                if not blob.exists(client):
+                    raise RuntimeError(f"Template not found in gs://{bucket_name}/{object_path}")
+                return blob.download_as_text()
+            except Exception as exc:
+                print(f"[instance-entrypoint] Failed to read gs://{bucket_name}/{object_path} via GCS client: {exc}")
+
         gcs_url = f"https://storage.googleapis.com/{parsed_location.netloc}{parsed_location.path}"
         with urlopen(gcs_url) as response_stream:
             raw_bytes = response_stream.read()
@@ -95,6 +123,114 @@ def restore_submitted_notebook(notebook_path: Path, study_code: str, submission_
     return write_notebook_if_valid(notebook_path, notebook_raw)
 
 
+def _register_fallback_activity_route(plainbook_main_module) -> None:
+    """Register /report_activity if the bundled plainbook package does not already expose it."""
+    try:
+        from bottle import post, response
+    except Exception:
+        return
+
+    try:
+        routes = getattr(plainbook_main_module.default_app(), "routes", [])
+        if any(getattr(route, "rule", "") == "/report_activity" for route in routes):
+            return
+    except Exception:
+        # If route inspection fails, fall back to registering the route.
+        pass
+
+    @post("/report_activity")
+    def report_activity():
+        mux_url = os.environ.get("PLAINBOOK_MUX_URL", "").strip()
+        container_id = os.environ.get("PLAINBOOK_CONTAINER_INSTANCE_ID", "").strip()
+        if not mux_url or not container_id:
+            return {"status": "error", "message": "Mux URL or container id not configured"}
+
+        api_url = mux_url.rstrip("/") + f"/api/sessions/{container_id}/activity"
+        try:
+            from urllib.request import Request, urlopen
+
+            req = Request(api_url, method="POST")
+            req.add_header("Content-Type", JSON_CONTENT_TYPE)
+            req.add_header("Authorization", f"Bearer {plainbook_main_module.AUTH_TOKEN}")
+            urlopen(req, data=b"{}", timeout=5)
+            response.content_type = JSON_CONTENT_TYPE
+            return {"status": "ok"}
+        except Exception as exc:
+            response.content_type = JSON_CONTENT_TYPE
+            return {"status": "error", "message": str(exc)}
+
+
+def _register_activity_request_hook(plainbook_main_module) -> None:
+    """Report activity from authenticated notebook API traffic.
+
+    This is a fallback for stale frontend bundles that may not emit
+    `/report_activity` pings from browser events yet.
+    """
+    try:
+        from bottle import request
+    except Exception:
+        return
+
+    app = plainbook_main_module.default_app()
+    throttle_seconds = 30.0
+    state = {"last_sent": 0.0}
+
+    ignored_prefixes = (
+        "/static/",
+        "/js/",
+        "/css/",
+        "/images/",
+        "/favicon",
+    )
+    ignored_exact = {
+        "/",
+        "/login",
+        "/report_activity",
+    }
+
+    def _has_valid_token() -> bool:
+        token = (
+            (request.query.get("token") or "").strip()
+            or (request.forms.get("token") or "").strip()
+        )
+        return bool(token and token == getattr(plainbook_main_module, "AUTH_TOKEN", ""))
+
+    def _post_activity_ping() -> None:
+        mux_url = os.environ.get("PLAINBOOK_MUX_URL", "").strip()
+        container_id = os.environ.get("PLAINBOOK_CONTAINER_INSTANCE_ID", "").strip()
+        auth_token = getattr(plainbook_main_module, "AUTH_TOKEN", "")
+        if not mux_url or not container_id or not auth_token:
+            return
+        api_url = mux_url.rstrip("/") + f"/api/sessions/{container_id}/activity"
+        from urllib.request import Request, urlopen
+
+        req = Request(api_url, method="POST")
+        req.add_header("Content-Type", JSON_CONTENT_TYPE)
+        req.add_header("Authorization", f"Bearer {auth_token}")
+        urlopen(req, data=b"{}", timeout=5)
+
+    @app.hook("before_request")
+    def _activity_hook() -> None:
+        try:
+            path = (request.path or "").strip()
+            if not path or path in ignored_exact:
+                return
+            if any(path.startswith(prefix) for prefix in ignored_prefixes):
+                return
+            if not _has_valid_token():
+                return
+
+            now = time.time()
+            if now - float(state["last_sent"]) < throttle_seconds:
+                return
+
+            _post_activity_ping()
+            state["last_sent"] = now
+        except Exception:
+            # best-effort fallback; never block notebook requests
+            return
+
+
 def main() -> None:
     notebook_path = Path(os.environ.get("PLAINBOOK_INSTANCE_NOTEBOOK", "/workspace/notebook.plnb"))
     workspace_root = notebook_path.parent
@@ -114,6 +250,22 @@ def main() -> None:
         study_code,
         submission_key,
     )
+
+    # Optionally report an initial activity ping to the mux so it records last_activity.
+    mux_url = os.environ.get("PLAINBOOK_MUX_URL", "").strip()
+    auth_token = os.environ.get("PLAINBOOK_INSTANCE_AUTH_TOKEN", "").strip()
+    if mux_url and submission_key and auth_token:
+        try:
+            from urllib.request import Request, urlopen
+            import json
+
+            api_url = mux_url.rstrip("/") + f"/api/sessions/{submission_key}/activity"
+            req = Request(api_url, method="POST")
+            req.add_header("Content-Type", JSON_CONTENT_TYPE)
+            req.add_header("Authorization", f"Bearer {auth_token}")
+            urlopen(req, data=b"{}", timeout=5)
+        except Exception:
+            pass
 
     if not restored_from_submission:
         template_location = os.environ.get("PLAINBOOK_TEMPLATE_LOCATION", "").strip()
@@ -145,6 +297,9 @@ def main() -> None:
 
     plainbook_main.STUDY_CODE = study_code or None
     plainbook_main.AUTH_TOKEN = auth_token
+    if study_code:
+        _register_fallback_activity_route(plainbook_main)
+        _register_activity_request_hook(plainbook_main)
     plainbook_main.main()
 
 

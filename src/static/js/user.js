@@ -2,14 +2,15 @@ const statusBox = document.getElementById('status');
 const startBtn = document.getElementById('start-btn');
 const codeInput = document.getElementById('launch-code');
 let launchInProgress = false;
+const INSTANCE_READY_TIMEOUT_SECONDS = 60; // 60 seconds timeout for instance to be ready
 
 function buildLaunchUrl(payload) {
-  const rawUrl = payload && payload.public_url ? String(payload.public_url) : '';
+  const rawUrl = String(payload?.public_url || '');
   if (!rawUrl) {
     return '';
   }
-  const url = new URL(rawUrl, window.location.origin);
-  const token = payload && payload.token ? String(payload.token) : '';
+  const url = new URL(rawUrl, globalThis.location?.origin || 'http://localhost');
+  const token = String(payload?.token || '');
   if (token && !url.searchParams.get('token')) {
     url.searchParams.set('token', token);
   }
@@ -18,6 +19,66 @@ function buildLaunchUrl(payload) {
 
 function setStatus(message) {
   statusBox.textContent = message;
+}
+
+function openLaunchTarget(targetUrl) {
+  const openedWindow = globalThis.open(targetUrl, '_blank', 'noopener,noreferrer');
+  setStatus(openedWindow ? 'Instance ready. Opened in a new tab.' : `Instance ready. Open it here: ${targetUrl}`);
+}
+
+function getLaunchErrorMessage(error) {
+  return String(error?.message || 'Launch failed');
+}
+
+async function pollInstanceReady(instanceId, maxWaitSeconds = INSTANCE_READY_TIMEOUT_SECONDS) {
+  const pollIntervalMs = 1000; // Poll every 1 second
+  const maxAttempts = Math.ceil((maxWaitSeconds * 1000) / pollIntervalMs);
+  let attempts = 0;
+
+  while (attempts < maxAttempts) {
+    attempts++;
+    try {
+      const response = await fetch(`/api/instance-status/${instanceId}`, {
+        method: 'GET',
+      });
+      
+      const data = await response.json();
+      
+      if (!response.ok) {
+        // Instance not found or other error, keep polling
+        const progress = Math.round((attempts / maxAttempts) * 100);
+        setStatus(`Starting instance... ${progress}%`);
+        await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+        continue;
+      }
+      
+      const instance = data;
+      
+      if (instance.public_url && instance.status === 'running') {
+        return instance;
+      }
+      
+      if (instance.status === 'exited') {
+        throw new Error(`Instance failed to start: ${instance.last_output || 'Unknown error'}`);
+      }
+      
+      // Instance not ready yet, show progress and retry
+      const elapsedSeconds = Math.round((attempts * pollIntervalMs) / 1000);
+      setStatus(`Starting instance... ${elapsedSeconds}s elapsed`);
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    } catch (error) {
+      if (!error.message.includes('Instance failed')) {
+        // Network error or other transient error, retry
+        const elapsedSeconds = Math.round((attempts * pollIntervalMs) / 1000);
+        setStatus(`Starting instance... ${elapsedSeconds}s elapsed`);
+        await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+        continue;
+      }
+      throw error;
+    }
+  }
+  
+  throw new Error('Instance startup timed out. Please try again.');
 }
 
 async function launchPlainbook() {
@@ -49,22 +110,24 @@ async function launchPlainbook() {
         : String(payload || 'Launch failed');
       throw new Error(message);
     }
-    if (payload.public_url) {
+    
+    // Handle non-blocking response (status="starting", public_url=null)
+    if (payload.status === 'starting' && !payload.public_url) {
+      setStatus('Instance is provisioning, waiting for it to be ready...');
+      const readyInstance = await pollInstanceReady(payload.id);
+      const targetUrl = buildLaunchUrl(readyInstance);
+      setStatus('Instance ready! Opening...');
+      openLaunchTarget(targetUrl);
+    } else {
+      // Handle immediate response (legacy or other backends)
       const targetUrl = buildLaunchUrl(payload);
       if (!targetUrl) {
-        throw new Error('Instance URL unavailable');
+        throw new Error('Instance is still starting. Please try again shortly.');
       }
-      const openedWindow = window.open(targetUrl, '_blank', 'noopener,noreferrer');
-      if (openedWindow) {
-        setStatus('Instance ready. Opened in a new tab.');
-      } else {
-        setStatus(`Instance ready. Open it here: ${targetUrl}`);
-      }
-    } else {
-      setStatus('Instance started and is initializing. Please try again shortly.');
+      openLaunchTarget(targetUrl);
     }
   } catch (error) {
-    const rawMessage = error && error.message ? String(error.message) : 'Launch failed';
+    const rawMessage = getLaunchErrorMessage(error);
     if (rawMessage.includes('did not match the expected pattern')) {
       setStatus('Access code wrong, please contact the adminitrator');
     } else {

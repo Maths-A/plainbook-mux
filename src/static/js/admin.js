@@ -47,6 +47,24 @@ function formatUnixTimestamp(ts) {
   return new Date(ts * 1000).toLocaleString();
 }
 
+function formatRelativeTime(ts) {
+  if (!ts || ts <= 0) {
+    return '-';
+  }
+  const now = Date.now() / 1000; // current unix timestamp in seconds
+  const secondsAgo = Math.max(0, now - ts);
+  if (secondsAgo < 60) {
+    return `${Math.floor(secondsAgo)}s ago`;
+  }
+  if (secondsAgo < 3600) {
+    return `${Math.floor(secondsAgo / 60)}m ago`;
+  }
+  if (secondsAgo < 86400) {
+    return `${Math.floor(secondsAgo / 3600)}h ago`;
+  }
+  return `${Math.floor(secondsAgo / 86400)}d ago`;
+}
+
 function renderStudyOptions() {
   if (!studyCodes.length) {
     generatedStudySelect.innerHTML = '<option value="">No study codes available</option>';
@@ -300,7 +318,10 @@ function renderAccessCodeRows() {
   accessCodeRowsBody.innerHTML = accessCodeRows.map((row, index) => `
     <tr>
       <td><input data-index="${index}" data-field="code" value="${escapeHtml(row.code)}" placeholder="Your access code"></td>
-      <td><input data-index="${index}" data-field="template" value="${escapeHtml(row.template)}" placeholder="A new file will be created"></td>
+      <td style="display:flex; gap:8px; align-items:center;">
+        <input data-index="${index}" data-field="template" value="${escapeHtml(row.template)}" placeholder="A new file will be created" style="flex:1;">
+        <button class="secondary" type="button" data-upload-index="${index}">Upload</button>
+      </td>
       <td><button class="secondary" type="button" data-remove-index="${index}">Remove</button></td>
     </tr>
   `).join('');
@@ -322,6 +343,58 @@ function renderAccessCodeRows() {
         accessCodeRows.splice(idx, 1);
         renderAccessCodeRows();
       }
+    });
+  });
+
+  accessCodeRowsBody.querySelectorAll('button[data-upload-index]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const idx = Number(button.getAttribute('data-upload-index'));
+      if (Number.isNaN(idx) || !accessCodeRows[idx]) return;
+      // Create a temporary file input
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.plnb,.json,.md,.txt,.zip';
+      input.addEventListener('change', async () => {
+        const file = input.files && input.files[0];
+        if (!file) return;
+        button.disabled = true;
+        const prevText = button.textContent;
+        button.textContent = 'Uploading...';
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 30000);
+          const form = new FormData();
+          form.append('file', file, file.name);
+          const resp = await fetch('/api/admin/templates/upload', {
+            method: 'POST',
+            body: form,
+            signal: controller.signal,
+          });
+          clearTimeout(timer);
+          if (!resp.ok) {
+            const txt = await resp.text();
+            throw new Error(txt || `Upload failed (${resp.status})`);
+          }
+          const payload = await resp.json();
+          const location = payload.location || '';
+          accessCodeRows[idx].template = location;
+          // update the input field value in DOM
+          const templateInput = accessCodeRowsBody.querySelector(`input[data-index="${idx}"][data-field="template"]`);
+          if (templateInput) templateInput.value = location;
+          showToast('Template uploaded');
+        } catch (err) {
+          showToast(err.message || 'Upload failed');
+        } finally {
+          button.disabled = false;
+          button.textContent = prevText;
+        }
+      });
+      // trigger file picker
+      document.body.appendChild(input);
+      input.style.display = 'none';
+      input.click();
+      // cleanup after a short delay
+      setTimeout(() => { try { document.body.removeChild(input); } catch (_) {} }, 60000);
     });
   });
 }
@@ -548,6 +621,29 @@ function statusClass(status) {
   return 'exited';
 }
 
+const relativeTimeFormatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
+
+function formatLastActive(value) {
+  if (!value) return '-';
+  const timestampMs = value * 1000;
+  const diffSeconds = Math.round((Date.now() - timestampMs) / 1000);
+  if (!Number.isFinite(diffSeconds)) return '-';
+  const absSeconds = Math.abs(diffSeconds);
+  if (absSeconds < 60) {
+    return relativeTimeFormatter.format(-diffSeconds, 'second');
+  }
+  const diffMinutes = Math.round(diffSeconds / 60);
+  if (Math.abs(diffMinutes) < 60) {
+    return relativeTimeFormatter.format(-diffMinutes, 'minute');
+  }
+  const diffHours = Math.round(diffMinutes / 60);
+  if (Math.abs(diffHours) < 24) {
+    return relativeTimeFormatter.format(-diffHours, 'hour');
+  }
+  const diffDays = Math.round(diffHours / 24);
+  return relativeTimeFormatter.format(-diffDays, 'day');
+}
+
 function renderCards(items) {
   cards.innerHTML = '';
   if (!items.length) {
@@ -563,10 +659,11 @@ function renderCards(items) {
       <div>
         <h3>${item.id}</h3>
         <div class="meta">Notebook: ${item.notebook_path}</div>
-        <div class="meta">Port: ${item.port} · Started: ${item.created_at_label}</div>
+        <div class="meta">Started: ${item.created_at_label}</div>
+        <div class="meta">Last active: ${formatRelativeTime(item.last_activity)}</div>
         <div class="meta">Code: ${item.launch_code || '-'}</div>
-          <div class="meta">Study: ${item.study_code || '-'}</div>
-        <div class="meta">PID: ${item.pid || '-'} · CPU: ${item.usage ? item.usage.cpu_percent + '%' : 'n/a'} · RAM: ${item.usage ? item.usage.memory_mb + ' MB' : 'n/a'}</div>
+        <div class="meta">Study: ${item.study_code || '-'}</div>
+        
         ${item.exit_code !== null ? `<div class="meta">Exit code: ${item.exit_code}</div>` : ''}
       </div>
       <div>
