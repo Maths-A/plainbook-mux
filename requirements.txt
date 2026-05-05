@@ -1,2 +1,6 @@
 bottle>=0.12,<1
 plainbook @ git+https://github.com/lucadealfaro/plainbook.git@user_studies
+pandas
+numpy 
+matplotlib
+scipy

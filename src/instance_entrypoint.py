@@ -292,6 +292,7 @@ def main() -> None:
     ]
     if study_code:
         sys.argv.append("--user-study")
+        sys.argv.append("--log")
 
     import plainbook.main as plainbook_main
 

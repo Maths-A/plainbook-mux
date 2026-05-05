@@ -137,6 +137,7 @@ LAUNCH_CODE_RECENT_STOP_GRACE_SECONDS = read_env_int("PLAINBOOK_LAUNCH_CODE_RECE
 PLAINBOOK_UPLOAD_KEY_FILE = os.environ.get("PLAINBOOK_UPLOAD_KEY_FILE", "").strip()
 GCS_STUDY_BUCKET = os.environ.get("GCS_STUDY_BUCKET", "").strip()
 PLAINBOOK_UPLOAD_KEY_JSON = os.environ.get("PLAINBOOK_UPLOAD_KEY_JSON", "").strip()
+DEFAULT_GEMINI_API_KEY = os.environ.get("PLAINBOOK_DEFAULT_GEMINI_API_KEY", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()
 ACCESS_CODE_GCS_BUCKET = os.environ.get("PLAINBOOK_ACCESS_CODE_GCS_BUCKET", "").strip() or GCS_STUDY_BUCKET
 ACCESS_CODE_GCS_PREFIX = os.environ.get("PLAINBOOK_ACCESS_CODE_GCS_PREFIX", "plainbook/user-studies/config").strip().strip("/")
 if not PLAINBOOK_UPLOAD_KEY_JSON and PLAINBOOK_UPLOAD_KEY_FILE:
@@ -277,6 +278,8 @@ def build_instance_env(
     submission_key = (launch_code or "").strip() or instance_dir.name
     env["PLAINBOOK_CONTAINER_INSTANCE_ID"] = submission_key
     env["PLAINBOOK_RUNTIME_INSTANCE_ID"] = instance_dir.name
+    if DEFAULT_GEMINI_API_KEY:
+      env["GEMINI_API_KEY"] = DEFAULT_GEMINI_API_KEY
     if study_code:
       env["PLAINBOOK_STUDY_CODE"] = study_code
       if GCS_STUDY_BUCKET:
@@ -600,6 +603,8 @@ def build_container_env(
         "PLAINBOOK_RUNTIME_INSTANCE_ID": instance_id,
         "PLAINBOOK_KERNEL_STRICT_MODE": "1" if KERNEL_STRICT_MODE else "0",
     }
+    if DEFAULT_GEMINI_API_KEY:
+      env["GEMINI_API_KEY"] = DEFAULT_GEMINI_API_KEY
     if template_location:
       env["PLAINBOOK_TEMPLATE_LOCATION"] = template_location
     if study_code:
