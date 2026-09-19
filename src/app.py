@@ -2380,11 +2380,31 @@ def session_activity(instance_id: str):
     bearer = auth.split(" ", 1)[1].strip()
 
   with launcher._lock:
-    # Direct id match
-    record = launcher._instances.get(instance_id)
+    # The bearer token is the only identifier here that is unique to one
+    # instance, so resolve by it first. The id the instance sends is its
+    # submission key, which is the launch code whenever one was used
+    # (PLAINBOOK_CONTAINER_INSTANCE_ID, set in _cloud_run_instance_env), and a
+    # participant relaunching reuses that code -- so matching on the id alone
+    # can land on an earlier, finished session whose token then fails the check
+    # below, rejecting pings from the session that is actually running.
+    record = None
+    if bearer:
+      for r in launcher._instances.values():
+        if r.token and r.token == bearer and launcher._record_is_running(r):
+          record = r
+          break
+
+    # Fall back to the id. Only live records are considered, so a finished
+    # session can never shadow the one now running under the same code.
+    if not record:
+      candidate = launcher._instances.get(instance_id)
+      if candidate is not None and launcher._record_is_running(candidate):
+        record = candidate
     # Fallbacks: backend_ref exact, launch_code exact, backend_ref contains, backend_url host/path match
     if not record:
       for r in launcher._instances.values():
+        if not launcher._record_is_running(r):
+          continue
         try:
           if r.backend_ref == instance_id:
             record = r
@@ -2401,12 +2421,6 @@ def session_activity(instance_id: str):
             break
         except Exception:
           continue
-    if not record:
-      # As a final fallback, the instance may have forwarded using its auth token
-      if bearer:
-        token_match = launcher.find_running_instance_by_token(bearer)
-        if token_match is not None:
-          record = token_match
     if not record:
       raise HTTPError(404, "Instance not found")
 
