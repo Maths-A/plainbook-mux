@@ -18,7 +18,7 @@ RUN apt-get update \
 COPY requirements.txt ./requirements.txt
 
 # Refresh dependency layer when the plainbook user_studies branch head changes.
-ADD https://api.github.com/repos/lucadealfaro/plainbook/commits/user_studies /tmp/plainbook-user_studies-head.json
+ADD https://api.github.com/repos/plainbook-ai/plainbook/commits/user_studies /tmp/plainbook-user_studies-head.json
 
 RUN pip install --no-cache-dir -r requirements.txt
 
