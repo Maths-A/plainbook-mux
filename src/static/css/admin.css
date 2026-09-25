@@ -278,7 +278,7 @@ button:disabled { cursor: wait; opacity: 0.6; transform: none; }
   text-align: left;
   vertical-align: middle;
 }
-.rows-table input {
+.rows-table input:not([type="checkbox"]) {
   width: 100%;
   border: 1px solid rgba(255,255,255,0.16);
   border-radius: 10px;
@@ -286,6 +286,10 @@ button:disabled { cursor: wait; opacity: 0.6; transform: none; }
   color: var(--text);
   padding: 8px 10px;
   font: inherit;
+}
+.rows-table input[type="checkbox"] {
+  width: auto;
+  accent-color: var(--accent);
 }
 .modal-actions {
   display: flex;

@@ -29,6 +29,23 @@ let accessCodeRows = [];
 let studyCodes = [];
 let generatedCodeRows = [];
 
+// Plainbook flags an admin can enable per study code -- kept in sync with
+// ALLOWED_INSTANCE_FLAGS in app.py (same keys, same order). --logview is
+// included alongside the participant-facing ones because a study code can
+// also be used to host a read-only replay of an already-submitted notebook
+// (set only "logview", point the template at that notebook) rather than a
+// fresh participant session.
+const INSTANCE_FLAG_OPTIONS = [
+  { key: 'user-study', label: 'User study', hint: 'Locks notebook management; shows the Submit button' },
+  { key: 'log', label: 'Log', hint: 'Records participant actions into the notebook for replay' },
+  { key: 'logview', label: 'Log view', hint: 'Read-only replay of an existing log; rejects all edits' },
+  { key: 'print-all', label: 'Print all', hint: 'Include the navbar and panels in browser print/PDF' },
+  { key: 'debug', label: 'Debug', hint: 'Verbose server-side logging' },
+];
+// What a study-code entry gets when it has no "flags" of its own -- matches
+// what every launch got unconditionally before this feature existed.
+const DEFAULT_INSTANCE_FLAGS = ['user-study', 'log'];
+
 function switchAccessModalTab(tabName) {
   const isStudy = tabName === 'study';
   tabBtnStudy.classList.toggle('active', isStudy);
@@ -311,7 +328,7 @@ function escapeHtml(value) {
 
 function renderAccessCodeRows() {
   if (!accessCodeRows.length) {
-    accessCodeRowsBody.innerHTML = '<tr><td colspan="3" class="footnote">No rows yet. Click Add row.</td></tr>';
+    accessCodeRowsBody.innerHTML = '<tr><td colspan="4" class="footnote">No rows yet. Click Add row.</td></tr>';
     return;
   }
 
@@ -322,16 +339,41 @@ function renderAccessCodeRows() {
         <input data-index="${index}" data-field="template" value="${escapeHtml(row.template)}" placeholder="A new file will be created" style="flex:1;">
         <button class="secondary" type="button" data-upload-index="${index}">Upload</button>
       </td>
+      <td>
+        <div style="display:flex; flex-wrap:wrap; gap:4px 12px;">
+          ${INSTANCE_FLAG_OPTIONS.map((opt) => `
+            <label style="display:inline-flex; align-items:center; gap:4px; font-weight:normal; margin:0; white-space:nowrap;" title="${escapeHtml(opt.hint)}">
+              <input type="checkbox" data-index="${index}" data-flag="${opt.key}" ${row.flags.includes(opt.key) ? 'checked' : ''}>
+              ${escapeHtml(opt.label)}
+            </label>
+          `).join('')}
+        </div>
+      </td>
       <td><button class="secondary" type="button" data-remove-index="${index}">Remove</button></td>
     </tr>
   `).join('');
 
-  accessCodeRowsBody.querySelectorAll('input[data-index]').forEach((input) => {
+  accessCodeRowsBody.querySelectorAll('input[data-field]').forEach((input) => {
     input.addEventListener('input', (event) => {
       const idx = Number(event.target.getAttribute('data-index'));
       const field = event.target.getAttribute('data-field');
       if (!Number.isNaN(idx) && accessCodeRows[idx]) {
         accessCodeRows[idx][field] = event.target.value;
+      }
+    });
+  });
+
+  accessCodeRowsBody.querySelectorAll('input[data-flag]').forEach((checkbox) => {
+    checkbox.addEventListener('change', (event) => {
+      const idx = Number(event.target.getAttribute('data-index'));
+      const flag = event.target.getAttribute('data-flag');
+      const row = accessCodeRows[idx];
+      if (Number.isNaN(idx) || !row) return;
+      const has = row.flags.includes(flag);
+      if (event.target.checked && !has) {
+        row.flags.push(flag);
+      } else if (!event.target.checked && has) {
+        row.flags = row.flags.filter((f) => f !== flag);
       }
     });
   });
@@ -411,6 +453,7 @@ function normalizeAccessCodeRows(rawJson) {
   }
   return Object.entries(parsed).map(([code, value]) => {
     let template = '';
+    let flags = null;
     if (typeof value === 'string') {
       template = value;
     } else if (value && typeof value === 'object') {
@@ -420,8 +463,17 @@ function normalizeAccessCodeRows(rawJson) {
           break;
         }
       }
+      if (Array.isArray(value.flags)) {
+        const allowed = new Set(INSTANCE_FLAG_OPTIONS.map((opt) => opt.key));
+        flags = value.flags.filter((f) => allowed.has(f));
+      }
     }
-    return { code, template };
+    // No "flags" key at all (a bare template string, or a dict that predates
+    // this feature): fall back to what every launch used to get, matching
+    // get_instance_flags_for_code's DEFAULT_INSTANCE_FLAGS in app.py. An
+    // explicit "flags": [] is left as-is -- that is a deliberate zero-flag
+    // launch, not a missing field.
+    return { code, template, flags: flags === null ? [...DEFAULT_INSTANCE_FLAGS] : flags };
   }).sort((a, b) => a.code.localeCompare(b.code));
 }
 
@@ -439,7 +491,7 @@ function closeAccessCodeModal() {
 }
 
 function addAccessCodeRow() {
-  accessCodeRows.push({ code: '', template: '' });
+  accessCodeRows.push({ code: '', template: '', flags: [...DEFAULT_INSTANCE_FLAGS] });
   renderAccessCodeRows();
 }
 
@@ -584,7 +636,13 @@ async function saveAccessCodes() {
       return;
     }
     seenCodes.add(code);
-    configObject[code] = { template: template || null };
+    // Order flags the same way ALLOWED_INSTANCE_FLAGS/INSTANCE_FLAG_OPTIONS
+    // does, rather than checkbox-click order, so the saved JSON reads the
+    // same regardless of the order boxes were ticked in.
+    const orderedFlags = INSTANCE_FLAG_OPTIONS
+      .map((opt) => opt.key)
+      .filter((key) => row.flags.includes(key));
+    configObject[code] = { template: template || null, flags: orderedFlags };
   }
 
   if (!Object.keys(configObject).length) {

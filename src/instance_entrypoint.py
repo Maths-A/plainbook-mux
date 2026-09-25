@@ -11,6 +11,24 @@ from urllib.request import urlopen
 
 JSON_CONTENT_TYPE = "application/json"
 
+# Kept in sync with ALLOWED_INSTANCE_FLAGS in app.py, which is the only thing
+# that ever writes PLAINBOOK_INSTANCE_FLAGS -- this is just the matching
+# reader running inside the child container, applied defensively in case a
+# stale mux image or a hand-set env var ever sends something unexpected.
+ALLOWED_INSTANCE_FLAGS = {"user-study", "log", "logview", "print-all", "debug"}
+
+
+def resolve_instance_flags(study_code: str) -> list[str]:
+    """The plainbook flags mux chose for this launch, from PLAINBOOK_INSTANCE_FLAGS
+    (a comma-separated list, set by app.py's build_container_env -- always
+    present, even as ""). Falls back to the pre-flag-selection default of
+    --user-study --log for a study launch when the variable is entirely
+    absent, which only happens against a mux image older than this feature."""
+    raw = os.environ.get("PLAINBOOK_INSTANCE_FLAGS")
+    if raw is None:
+        return ["user-study", "log"] if study_code else []
+    return [flag for flag in (part.strip() for part in raw.split(",")) if flag in ALLOWED_INSTANCE_FLAGS]
+
 
 def read_template_source(template_location: str) -> str:
     location = template_location.strip()
@@ -290,9 +308,8 @@ def main() -> None:
         "--port",
         port,
     ]
-    if study_code:
-        sys.argv.append("--user-study")
-        sys.argv.append("--log")
+    for flag in resolve_instance_flags(study_code):
+        sys.argv.append(f"--{flag}")
 
     import plainbook.main as plainbook_main
 

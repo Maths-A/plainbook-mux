@@ -208,7 +208,7 @@ def resolve_plainbook_command() -> list[str]:
   return [sys.executable, "-m", "plainbook.main"]
 
 
-def build_plainbook_command(notebook_path: Path, port: int, user_study_enabled: bool = False) -> list[str]:
+def build_plainbook_command(notebook_path: Path, port: int, flags: list[str] | None = None) -> list[str]:
   command = [
         *resolve_plainbook_command(),
         str(notebook_path),
@@ -217,8 +217,8 @@ def build_plainbook_command(notebook_path: Path, port: int, user_study_enabled: 
         "--port",
         str(port),
     ]
-  if user_study_enabled:
-    command.append("--user-study")
+  for flag in (flags or []):
+    command.append(f"--{flag}")
   return command
 
 
@@ -590,6 +590,7 @@ def build_container_env(
   launch_code: str | None = None,
   auth_token: str | None = None,
   mux_url: str | None = None,
+  flags: list[str] | None = None,
 ) -> dict[str, str]:
     submission_key = (launch_code or "").strip() or instance_id
     env = {
@@ -602,6 +603,10 @@ def build_container_env(
         "PLAINBOOK_CONTAINER_INSTANCE_ID": submission_key,
         "PLAINBOOK_RUNTIME_INSTANCE_ID": instance_id,
         "PLAINBOOK_KERNEL_STRICT_MODE": "1" if KERNEL_STRICT_MODE else "0",
+        # Always set, even to "": distinguishes "mux chose zero flags" from
+        # "this mux predates flag selection", which instance_entrypoint.py
+        # falls back on for --user-study/--log via the study_code default.
+        "PLAINBOOK_INSTANCE_FLAGS": ",".join(flags or []),
     }
     if DEFAULT_GEMINI_API_KEY:
       env["GEMINI_API_KEY"] = DEFAULT_GEMINI_API_KEY
@@ -689,6 +694,7 @@ def build_cloud_run_service_body(
     study_code: str | None = None,
     launch_code: str | None = None,
   mux_url: str | None = None,
+  flags: list[str] | None = None,
 ) -> dict:
     image = require_instance_container_image()
     env_items = [
@@ -700,6 +706,7 @@ def build_cloud_run_service_body(
           launch_code=launch_code,
             auth_token=auth_token,
             mux_url=mux_url,
+            flags=flags,
         ).items()
     ]
     _, project_id = _cloud_run_session_and_project()
@@ -711,6 +718,12 @@ def build_cloud_run_service_body(
         labels["plainbook-launch-hash"] = build_launch_code_hash(launch_code)
     if study_code:
       annotations["plainbook-mux.dev/study-code"] = study_code
+    if flags:
+      # Lets a mux restart reconcile a still-running service's InstanceRecord
+      # (see _cloud_run_service_to_record) with the flags it actually
+      # launched with, for accurate admin display -- the child itself reads
+      # its flags from its own env, set once at creation, not from here.
+      annotations["plainbook-mux.dev/flags"] = ",".join(flags)
     return {
         "invokerIamDisabled": True,
         "labels": labels,
@@ -743,6 +756,7 @@ def build_docker_run_command(
   launch_code: str | None = None,
     auth_token: str | None = None,
     mux_url: str | None = None,
+    flags: list[str] | None = None,
 ) -> tuple[list[str], str, int]:
     image = require_instance_container_image()
     host_port = find_free_port()
@@ -754,6 +768,7 @@ def build_docker_run_command(
       launch_code=launch_code,
         auth_token=auth_token,
         mux_url=mux_url,
+        flags=flags,
     )
     cmd = [
         "docker",
@@ -795,6 +810,8 @@ def _cloud_run_service_to_record(service: dict) -> InstanceRecord | None:
     study_code = annotations.get("plainbook-mux.dev/study-code") if isinstance(annotations, dict) else None
     if not isinstance(study_code, str) or not study_code:
       study_code = None
+    flags_annotation = annotations.get("plainbook-mux.dev/flags") if isinstance(annotations, dict) else None
+    flags = [f for f in flags_annotation.split(",") if f] if isinstance(flags_annotation, str) else []
     return InstanceRecord(
       id=instance_id,
       notebook_path=Path("/workspace/notebook.plnb"),
@@ -802,6 +819,7 @@ def _cloud_run_service_to_record(service: dict) -> InstanceRecord | None:
       token=token,
       status="running",
       study_code=study_code,
+      flags=flags,
       backend_kind="cloud-run",
       backend_ref=service_name.rsplit("/", 1)[-1],
       backend_url=service_url,
@@ -1219,6 +1237,48 @@ def read_access_code_config_text() -> str:
   return raw
 
 
+# Plainbook flags an admin can enable per study code, applied to every
+# instance launched under it. Restricted to boolean flags that make sense for
+# an instance mux launches on someone's behalf: excludes --app-window (there
+# is no display in a container), --use-browser (deprecated, does nothing) and
+# --dump-ai-requests (takes an argument, not a simple toggle). Order here is
+# the order they are applied in and the order admin.js renders them in --
+# keep the two lists in sync.
+ALLOWED_INSTANCE_FLAGS = ["user-study", "log", "logview", "print-all", "debug"]
+# Applied when a study-code entry is a bare template string, or a dict that
+# omits "flags" -- i.e. every config written before this feature existed.
+# Matches what every launch used to get unconditionally, so existing study
+# codes keep behaving exactly as before.
+DEFAULT_INSTANCE_FLAGS = ["user-study", "log"]
+
+
+def _normalize_instance_flags(value: object) -> list[str]:
+    """Filters `value` down to ALLOWED_INSTANCE_FLAGS, in that fixed order.
+
+    Anything else -- an unrecognised name, a non-list value -- is dropped
+    rather than raising, so a hand-edited config document can never inject an
+    arbitrary plainbook argument (e.g. a stray "host=..." string)."""
+    if not isinstance(value, list):
+        return []
+    requested = {str(item).strip().lstrip("-") for item in value if isinstance(item, str)}
+    return [flag for flag in ALLOWED_INSTANCE_FLAGS if flag in requested]
+
+
+def get_instance_flags_for_code(launch_code: str) -> list[str]:
+    """The plainbook flags configured for the study code `launch_code`
+    resolves to. Falls back to DEFAULT_INSTANCE_FLAGS when the entry has no
+    "flags" key (a bare template string, or a dict predating this feature)."""
+    resolved_study_code = resolve_study_code_for_launch(launch_code)
+    if not resolved_study_code:
+        return list(DEFAULT_INSTANCE_FLAGS)
+
+    config = load_access_code_config()
+    entry = config.get(resolved_study_code)
+    if isinstance(entry, dict) and "flags" in entry:
+        return _normalize_instance_flags(entry.get("flags"))
+    return list(DEFAULT_INSTANCE_FLAGS)
+
+
 def get_template_location_for_code(launch_code: str) -> str | None:
     resolved_study_code = resolve_study_code_for_launch(launch_code)
     if not resolved_study_code:
@@ -1349,6 +1409,7 @@ class InstanceRecord:
     backend_ref: str | None = None
     backend_url: str | None = None
     last_activity: float = field(default_factory=time.time)
+    flags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         usage = get_process_usage(self.process.pid) if self.process is not None else None
@@ -1373,6 +1434,7 @@ class InstanceRecord:
             "backend_url": self.backend_url,
             "last_activity": self.last_activity,
             "usage": usage,
+            "flags": list(self.flags),
         }
 
 
@@ -1490,6 +1552,7 @@ class PlainbookLauncher:
       study_code: str | None = None,
       launch_code: str | None = None,
       mux_url: str | None = None,
+      flags: list[str] | None = None,
   ) -> tuple[str, str, int]:
     container_token = build_instance_auth_token(instance_id)
     cmd, container_name, host_port = build_docker_run_command(
@@ -1500,6 +1563,7 @@ class PlainbookLauncher:
       launch_code=launch_code,
         auth_token=container_token,
         mux_url=mux_url,
+        flags=flags,
     )
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if result.returncode != 0:
@@ -1519,6 +1583,7 @@ class PlainbookLauncher:
       study_code: str | None = None,
       launch_code: str | None = None,
       mux_url: str | None = None,
+      flags: list[str] | None = None,
   ) -> tuple[str, str]:
     service_name = build_cloud_run_service_name(instance_id)
     session, project_id = _cloud_run_session_and_project()
@@ -1534,6 +1599,7 @@ class PlainbookLauncher:
       study_code=study_code,
       launch_code=launch_code,
       mux_url=mux_url,
+      flags=flags,
     )
     result = session.post(api_url, json=payload, timeout=120)
     if result.status_code >= 400:
@@ -1557,6 +1623,7 @@ class PlainbookLauncher:
     tmp_dir.mkdir(parents=True, exist_ok=True)
     notebook_path = instance_dir / "notebook.plnb"
     template_location = get_template_location_for_code(launch_code or "")
+    flags = get_instance_flags_for_code(launch_code or "")
     study_code = template_code or launch_code
     prepare_notebook_for_code(notebook_path, template_code or launch_code)
     if INSTANCE_BACKEND in {"docker", "cloud-run"} and not notebook_path.exists():
@@ -1573,6 +1640,7 @@ class PlainbookLauncher:
         study_code=study_code,
         launch_code=launch_code,
         mux_url=mux_url,
+        flags=flags,
       )
       record = InstanceRecord(
         id=instance_id,
@@ -1586,6 +1654,7 @@ class PlainbookLauncher:
         backend_kind="docker",
         backend_ref=backend_ref,
         backend_url=backend_url,
+        flags=flags,
       )
       # Set the cached token for container backends
       with self._lock:
@@ -1606,6 +1675,7 @@ class PlainbookLauncher:
         backend_kind="cloud-run",
         backend_ref=service_name,
         backend_url=None,
+        flags=flags,
       )
       # Generate and cache the per-instance token immediately so lookups and
       # callbacks can authenticate even while provisioning proceeds.
@@ -1620,7 +1690,7 @@ class PlainbookLauncher:
       if ISOLATION_ENABLED and sys.platform == "darwin" and MACOS_SANDBOX_ENABLED and shutil.which("sandbox-exec"):
         sandbox_profile_path.write_text(build_macos_sandbox_profile(instance_dir), encoding="utf-8")
 
-      base_cmd = build_plainbook_command(notebook_path, port, user_study_enabled=bool(study_code))
+      base_cmd = build_plainbook_command(notebook_path, port, flags=flags)
       cmd, isolation_mode = build_isolated_command(base_cmd, sandbox_profile_path, instance_dir, tmp_dir)
 
       process = subprocess.Popen(
@@ -1644,6 +1714,7 @@ class PlainbookLauncher:
         isolation_mode=isolation_mode,
         backend_kind="process",
         backend_url=f"http://127.0.0.1:{port}",
+        flags=flags,
       )
       self._spawn_reader(record)
 
@@ -2218,6 +2289,7 @@ def admin_study_codes_get():
     studies.append({
       "code": code,
       "template": get_template_location_for_code(code),
+      "flags": get_instance_flags_for_code(code),
     })
   response.content_type = JSON_CONTENT_TYPE
   return {"studies": studies}
