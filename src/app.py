@@ -1802,6 +1802,7 @@ class PlainbookLauncher:
                 study_code=study_code,
                 launch_code=launch_code,
                 mux_url=mux_url,
+                flags=flags,
               )
               last_exc = None
               break
