@@ -24,6 +24,7 @@ const generatedStudyStats = document.getElementById('generated-study-stats');
 const generatedRowsBody = document.getElementById('generated-code-rows');
 const generatedStudySelect = document.getElementById('generated-study-select');
 const generatedCountInput = document.getElementById('generated-count');
+const generatedProfessorInput = document.getElementById('generated-professor');
 const generateCodesBtn = document.getElementById('generate-codes-btn');
 let accessCodeRows = [];
 let studyCodes = [];
@@ -126,7 +127,7 @@ function renderStudyOptions() {
 function renderGeneratedCodeRows() {
   renderGeneratedStudyStats();
   if (!generatedCodeRows.length) {
-    generatedRowsBody.innerHTML = '<tr><td colspan="6" class="footnote">No generated codes yet.</td></tr>';
+    generatedRowsBody.innerHTML = '<tr><td colspan="7" class="footnote">No generated codes yet.</td></tr>';
     return;
   }
 
@@ -143,6 +144,9 @@ function renderGeneratedCodeRows() {
         </select>
       </td>
       <td>
+        <input data-generated-index="${index}" data-generated-field="professor" value="${escapeHtml(row.professor || '')}" placeholder="—" style="width:100%; border:1px solid rgba(255,255,255,0.16); border-radius:10px; background:rgba(255,255,255,0.04); color:var(--text); padding:8px 10px; font:inherit;">
+      </td>
+      <td>
         <label style="display:flex; align-items:center; justify-content:center; margin:0;">
           <input type="checkbox" data-generated-index="${index}" data-generated-field="given" ${row.given ? 'checked' : ''}>
         </label>
@@ -155,6 +159,37 @@ function renderGeneratedCodeRows() {
       </td>
     </tr>
   `).join('');
+
+  generatedRowsBody.querySelectorAll('input[data-generated-field="professor"]').forEach((input) => {
+    const idx = Number(input.getAttribute('data-generated-index'));
+    const row = generatedCodeRows[idx];
+    if (!row) return;
+    let lastSaved = row.professor || '';
+    const commit = async () => {
+      const professor = input.value.trim();
+      if (professor === lastSaved) return; // nothing changed since the last save
+      try {
+        await api('/api/admin/generated-codes/update-professor', {
+          method: 'POST',
+          body: JSON.stringify({ code: row.code, professor }),
+        });
+        lastSaved = professor;
+        row.professor = professor;
+        generatedCodesError.textContent = '';
+      } catch (error) {
+        input.value = lastSaved; // revert on failure, matches the "given" checkbox's behavior
+        generatedCodesError.textContent = error.message;
+        showToast(error.message);
+      }
+    };
+    input.addEventListener('blur', commit);
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        input.blur(); // triggers the 'blur' listener above
+      }
+    });
+  });
 
   generatedRowsBody.querySelectorAll('select[data-generated-field="study"]').forEach((select) => {
     const idx = Number(select.getAttribute('data-generated-index'));
@@ -303,12 +338,13 @@ function exportGeneratedCodesCsv() {
     return;
   }
 
-  const header = ['code', 'study_code', 'given', 'used_count', 'created_at', 'last_used_at'];
+  const header = ['code', 'study_code', 'professor', 'given', 'used_count', 'created_at', 'last_used_at'];
   const lines = [header.join(',')];
   for (const row of generatedCodeRows) {
     const cols = [
       row.code,
       row.study_code,
+      row.professor || '',
       row.given ? 'yes' : 'no',
       row.used_count || 0,
       formatUnixTimestamp(row.created_at),
@@ -652,10 +688,11 @@ async function generateCodes() {
   generateCodesBtn.disabled = true;
   const prevText = generateCodesBtn.textContent;
   generateCodesBtn.textContent = 'Generating...';
+  const professor = generatedProfessorInput.value.trim();
   try {
     const payload = await api('/api/admin/generated-codes/generate', {
       method: 'POST',
-      body: JSON.stringify({ study_code: studyCode, count }),
+      body: JSON.stringify({ study_code: studyCode, count, professor }),
     });
     generatedCodesError.textContent = '';
     const createdCount = Array.isArray(payload.created_codes) ? payload.created_codes.length : 0;

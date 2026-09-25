@@ -2378,18 +2378,22 @@ def admin_generated_codes_get():
       used_count = 0
       last_used_at = None
       given = False
+      professor = ""
     elif isinstance(value, dict):
       study_code = value.get("study_code") if isinstance(value.get("study_code"), str) else ""
       created_at = value.get("created_at") if isinstance(value.get("created_at"), int) else None
       used_count = value.get("used_count") if isinstance(value.get("used_count"), int) else 0
       last_used_at = value.get("last_used_at") if isinstance(value.get("last_used_at"), int) else None
       given = value.get("given") if isinstance(value.get("given"), bool) else False
+      # Absent on every code generated before this field existed.
+      professor = value.get("professor") if isinstance(value.get("professor"), str) else ""
     else:
       continue
 
     items.append({
       "code": code,
       "study_code": study_code,
+      "professor": professor,
       "created_at": created_at,
       "given": given,
       "used_count": used_count,
@@ -2407,6 +2411,10 @@ def admin_generated_codes_generate():
   payload = request.json or {}
   study_code = str(payload.get("study_code", "")).strip()
   count = payload.get("count", 1)
+  # Who to attribute this whole batch to. Free text, no registry to check
+  # against (unlike study_code) -- optional, since not every generated code
+  # is generated on a professor's behalf (e.g. an admin's own test code).
+  professor = str(payload.get("professor", "")).strip()
 
   if study_code not in load_access_code_config():
     raise HTTPError(400, "Unknown study code")
@@ -2422,6 +2430,7 @@ def admin_generated_codes_generate():
     code = generate_unique_access_code()
     generated[code] = {
       "study_code": study_code,
+      "professor": professor,
       "created_at": now,
       "given": False,
       "used_count": 0,
@@ -2458,6 +2467,31 @@ def admin_generated_codes_update_study():
   response.content_type = JSON_CONTENT_TYPE
   return {"status": "ok"}
 
+
+@app.post("/api/admin/generated-codes/update-professor")
+@require_admin
+def admin_generated_codes_update_professor():
+  payload = request.json or {}
+  code = str(payload.get("code", "")).strip()
+  # Unlike study_code there is no registry to validate against -- free text,
+  # and "" is a valid value (clearing the attribution), not an error.
+  professor = str(payload.get("professor", "")).strip()
+  if not code:
+    raise HTTPError(400, "code is required")
+
+  generated = load_generated_access_codes()
+  entry = generated.get(code)
+  if entry is None:
+    raise HTTPError(404, "Generated code not found")
+  if isinstance(entry, str):
+    entry = {"study_code": entry, "used_count": 0}
+  if not isinstance(entry, dict):
+    raise HTTPError(400, "Generated code entry is invalid")
+  entry["professor"] = professor
+  generated[code] = entry
+  save_generated_access_codes(generated)
+  response.content_type = JSON_CONTENT_TYPE
+  return {"status": "ok"}
 
 
 @app.post("/api/sessions/<instance_id>/activity")
