@@ -11,34 +11,39 @@ from urllib.request import urlopen
 
 JSON_CONTENT_TYPE = "application/json"
 
-# Kept in sync with the constants of the same names in app.py, which is the
-# only thing that ever writes PLAINBOOK_INSTANCE_FLAGS -- this is just the
-# matching reader running inside the child container, applied defensively in
-# case a stale mux image or a hand-set env var ever sends something
-# unexpected. In particular MANDATORY_INSTANCE_FLAGS is enforced again here,
-# not only trusted from the env var: a launch with a study_code always gets
-# at least --user-study --log, even if PLAINBOOK_INSTANCE_FLAGS were somehow
-# tampered with or truncated between mux and this container.
-ALLOWED_INSTANCE_FLAGS = ["user-study", "log", "logview", "print-all", "debug"]
-MANDATORY_INSTANCE_FLAGS = {"user-study", "log"}
+# Kept in sync with MANDATORY_INSTANCE_FLAGS in app.py -- the only thing that
+# ever writes PLAINBOOK_INSTANCE_FLAGS. Enforced again here, not only trusted
+# from the env var: a launch with a study_code always gets at least
+# --user-study --log, even if PLAINBOOK_INSTANCE_FLAGS were somehow tampered
+# with or truncated between mux and this container. Anything beyond that is
+# free text an admin typed into the mux admin page, not checked against a
+# fixed set here either -- see _normalize_instance_flags's docstring in
+# app.py for why that is deliberate (in short: it reaches plainbook as one
+# literal argv token via subprocess, never through a shell, so it cannot
+# inject separate arguments -- at worst plainbook's own argparse rejects it).
+MANDATORY_INSTANCE_FLAGS = ["user-study", "log"]
 
 
 def resolve_instance_flags(study_code: str) -> list[str]:
-    """The plainbook flags to launch with, from PLAINBOOK_INSTANCE_FLAGS (a
-    comma-separated list, set by app.py's build_container_env -- always
-    present for a mux new enough to set it, even as ""). Falls back to the
-    pre-flag-selection default of --user-study --log for a study launch when
-    the variable is entirely absent, which only happens against a mux image
-    older than this feature. A study launch always gets at least
-    MANDATORY_INSTANCE_FLAGS, regardless of what the variable said."""
+    """The plainbook flags to launch with: MANDATORY_INSTANCE_FLAGS first
+    (always present for a study launch, regardless of what the env var said),
+    then whatever else PLAINBOOK_INSTANCE_FLAGS names (a comma-separated list
+    set by app.py's build_container_env -- always present for a mux new
+    enough to set it, even as ""), deduplicated, in the order given. Falls
+    back to the pre-flag-selection default of --user-study --log for a study
+    launch when the variable is entirely absent, which only happens against a
+    mux image older than this feature."""
     raw = os.environ.get("PLAINBOOK_INSTANCE_FLAGS")
-    if raw is None:
-        chosen = {"user-study", "log"} if study_code else set()
-    else:
-        chosen = {flag.strip() for flag in raw.split(",")} & set(ALLOWED_INSTANCE_FLAGS)
-    if study_code:
-        chosen |= MANDATORY_INSTANCE_FLAGS
-    return [flag for flag in ALLOWED_INSTANCE_FLAGS if flag in chosen]
+    seen = set(MANDATORY_INSTANCE_FLAGS) if study_code else set()
+    extras: list[str] = []
+    if raw is not None:
+        for part in raw.split(","):
+            flag = part.strip()
+            if flag and flag not in seen:
+                seen.add(flag)
+                extras.append(flag)
+    mandatory = list(MANDATORY_INSTANCE_FLAGS) if study_code else []
+    return mandatory + extras
 
 
 def read_template_source(template_location: str) -> str:

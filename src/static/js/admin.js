@@ -29,34 +29,48 @@ let accessCodeRows = [];
 let studyCodes = [];
 let generatedCodeRows = [];
 
-// Plainbook flags an admin can enable per study code -- kept in sync with
-// the constants of the same names in app.py (same keys, same order).
-// --logview is included alongside the participant-facing ones because a
-// study code can also be used to host a read-only replay of an
-// already-submitted notebook (set only "logview", point the template at that
-// notebook) rather than a fresh participant session.
-const INSTANCE_FLAG_OPTIONS = [
-  { key: 'user-study', label: 'User study', hint: 'Locks notebook management; shows the Submit button', mandatory: true },
-  { key: 'log', label: 'Log', hint: 'Records participant actions into the notebook for replay', mandatory: true },
-  { key: 'logview', label: 'Log view', hint: 'Read-only replay of an existing log; rejects all edits' },
-  { key: 'print-all', label: 'Print all', hint: 'Include the navbar and panels in browser print/PDF' },
-  { key: 'debug', label: 'Debug', hint: 'Verbose server-side logging' },
+// The two flags every study-code launch gets, no matter what -- rendered as
+// locked tags (not editable) and re-unioned into every row before it is
+// saved, so neither removing a tag nor hand-editing the underlying JSON can
+// drop them. Kept in sync with MANDATORY_INSTANCE_FLAGS in app.py.
+const MANDATORY_INSTANCE_FLAGS = [
+  { key: 'user-study', hint: 'Locks notebook management; shows the Submit button' },
+  { key: 'log', hint: 'Records participant actions into the notebook for replay' },
 ];
-// Every study code gets at least these -- rendered checked and disabled in
-// the table, and re-unioned into every row before it is saved, so neither
-// unchecking one nor hand-editing the underlying JSON can drop them.
-const MANDATORY_INSTANCE_FLAGS = INSTANCE_FLAG_OPTIONS.filter((opt) => opt.mandatory).map((opt) => opt.key);
+const MANDATORY_INSTANCE_FLAG_KEYS = MANDATORY_INSTANCE_FLAGS.map((f) => f.key);
 // What a study-code entry gets when it has no "flags" of its own -- matches
 // what every launch got unconditionally before this feature existed.
-const DEFAULT_INSTANCE_FLAGS = [...MANDATORY_INSTANCE_FLAGS];
+const DEFAULT_INSTANCE_FLAGS = [...MANDATORY_INSTANCE_FLAG_KEYS];
 
-// Unions MANDATORY_INSTANCE_FLAGS into `flags`, ordered like
-// INSTANCE_FLAG_OPTIONS. The one place both the render path and the save
+// Everything past user-study/log is free text an admin types in directly --
+// deliberately NOT checked against a fixed list of known plainbook flags, so
+// a newly added plainbook flag can be used the same day without an admin.js
+// change. That also means a typo (or anything else) is passed straight
+// through as --<text> to the plainbook process; it is on the admin to type
+// it right. build_plainbook_command appends each array entry as one argv
+// token via subprocess (no shell), so even an entry containing spaces can
+// only ever become one weird flag name -- plainbook's own argparse rejects
+// it and the instance fails to start, it cannot inject separate arguments.
+function normalizeFlagText(text) {
+  return String(text || '').trim().replace(/^-+/, '');
+}
+
+// Unions MANDATORY_INSTANCE_FLAG_KEYS into `flags` (mandatory ones first, in
+// their fixed order), keeps the rest in the order they were entered, drops
+// blanks and duplicates. The one place both the render path and the save
 // path route a row's flags through, so the two can never disagree about
-// which ones are locked on.
+// what actually ends up in the saved config.
 function withMandatoryFlags(flags) {
-  const chosen = new Set([...(flags || []), ...MANDATORY_INSTANCE_FLAGS]);
-  return INSTANCE_FLAG_OPTIONS.map((opt) => opt.key).filter((key) => chosen.has(key));
+  const extras = [];
+  const seen = new Set(MANDATORY_INSTANCE_FLAG_KEYS);
+  for (const raw of (flags || [])) {
+    const flag = normalizeFlagText(raw);
+    if (flag && !seen.has(flag)) {
+      seen.add(flag);
+      extras.push(flag);
+    }
+  }
+  return [...MANDATORY_INSTANCE_FLAG_KEYS, ...extras];
 }
 
 function switchAccessModalTab(tabName) {
@@ -353,15 +367,17 @@ function renderAccessCodeRows() {
         <button class="secondary" type="button" data-upload-index="${index}">Upload</button>
       </td>
       <td>
-        <div style="display:flex; flex-wrap:wrap; gap:4px 12px;">
-          ${INSTANCE_FLAG_OPTIONS.map((opt) => `
-            <label style="display:inline-flex; align-items:center; gap:4px; font-weight:normal; margin:0; white-space:nowrap; ${opt.mandatory ? 'opacity:0.65;' : ''}"
-                   title="${escapeHtml(opt.mandatory ? opt.hint + ' (always on for a study code)' : opt.hint)}">
-              <input type="checkbox" data-index="${index}" data-flag="${opt.key}"
-                     ${row.flags.includes(opt.key) ? 'checked' : ''} ${opt.mandatory ? 'disabled' : ''}>
-              ${escapeHtml(opt.label)}${opt.mandatory ? ' 🔒' : ''}
-            </label>
+        <div data-flag-tags="${index}" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:6px;">
+          ${MANDATORY_INSTANCE_FLAGS.map((f) => `
+            <span class="flag-tag flag-tag-locked" title="${escapeHtml(f.hint)} (always on for a study code)">${escapeHtml(f.key)} 🔒</span>
           `).join('')}
+          ${row.flags.filter((f) => !MANDATORY_INSTANCE_FLAG_KEYS.includes(f)).map((f) => `
+            <span class="flag-tag">${escapeHtml(f)}<button type="button" class="flag-tag-remove" data-index="${index}" data-remove-flag="${escapeHtml(f)}" aria-label="Remove ${escapeHtml(f)}">&times;</button></span>
+          `).join('')}
+        </div>
+        <div style="display:flex; gap:6px;">
+          <input data-index="${index}" data-flag-input placeholder="e.g. logview, print-all, debug" style="flex:1;">
+          <button class="secondary" type="button" data-add-flag="${index}">Add</button>
         </div>
       </td>
       <td><button class="secondary" type="button" data-remove-index="${index}">Remove</button></td>
@@ -378,22 +394,38 @@ function renderAccessCodeRows() {
     });
   });
 
-  // A mandatory flag's checkbox is rendered `disabled`, so this listener
-  // never fires for one from a real click; withMandatoryFlags (in
-  // normalizeAccessCodeRows / saveAccessCodes) is the actual backstop against
-  // it being unset some other way.
-  accessCodeRowsBody.querySelectorAll('input[data-flag]').forEach((checkbox) => {
-    checkbox.addEventListener('change', (event) => {
-      const idx = Number(event.target.getAttribute('data-index'));
-      const flag = event.target.getAttribute('data-flag');
+  // Adding a flag: the mandatory tags have no remove button (they are not
+  // in this query), so this only ever touches an admin-typed extra.
+  const addFlagFromInput = (idx) => {
+    const row = accessCodeRows[idx];
+    const input = accessCodeRowsBody.querySelector(`input[data-flag-input][data-index="${idx}"]`);
+    if (!row || !input) return;
+    const flag = normalizeFlagText(input.value);
+    if (!flag) return;
+    row.flags = withMandatoryFlags([...row.flags, flag]);
+    renderAccessCodeRows();
+  };
+
+  accessCodeRowsBody.querySelectorAll('button[data-add-flag]').forEach((button) => {
+    button.addEventListener('click', () => addFlagFromInput(Number(button.getAttribute('data-add-flag'))));
+  });
+
+  accessCodeRowsBody.querySelectorAll('input[data-flag-input]').forEach((input) => {
+    input.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      addFlagFromInput(Number(event.target.getAttribute('data-index')));
+    });
+  });
+
+  accessCodeRowsBody.querySelectorAll('button[data-remove-flag]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const idx = Number(button.getAttribute('data-index'));
+      const flag = button.getAttribute('data-remove-flag');
       const row = accessCodeRows[idx];
       if (Number.isNaN(idx) || !row) return;
-      const has = row.flags.includes(flag);
-      if (event.target.checked && !has) {
-        row.flags.push(flag);
-      } else if (!event.target.checked && has) {
-        row.flags = row.flags.filter((f) => f !== flag);
-      }
+      row.flags = row.flags.filter((f) => f !== flag);
+      renderAccessCodeRows();
     });
   });
 
@@ -483,8 +515,10 @@ function normalizeAccessCodeRows(rawJson) {
         }
       }
       if (Array.isArray(value.flags)) {
-        const allowed = new Set(INSTANCE_FLAG_OPTIONS.map((opt) => opt.key));
-        flags = value.flags.filter((f) => allowed.has(f));
+        // Free text, not checked against a fixed list -- withMandatoryFlags
+        // below still normalizes/dedupes each entry and puts user-study/log
+        // first, but any other string is accepted and carried through as-is.
+        flags = value.flags;
       }
     }
     // No "flags" key at all (a bare template string, or a dict that predates
@@ -656,8 +690,7 @@ async function saveAccessCodes() {
       return;
     }
     seenCodes.add(code);
-    // withMandatoryFlags both orders flags like INSTANCE_FLAG_OPTIONS
-    // (rather than checkbox-click order) and unions user-study/log back in,
+    // withMandatoryFlags puts user-study/log first and unions them back in,
     // so the saved JSON can never end up missing them even if row.flags
     // somehow lost track of one.
     configObject[code] = { template: template || null, flags: withMandatoryFlags(row.flags) };

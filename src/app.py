@@ -1237,23 +1237,15 @@ def read_access_code_config_text() -> str:
   return raw
 
 
-# Plainbook flags an admin can enable per study code, applied to every
-# instance launched under it. Restricted to boolean flags that make sense for
-# an instance mux launches on someone's behalf: excludes --app-window (there
-# is no display in a container), --use-browser (deprecated, does nothing) and
-# --dump-ai-requests (takes an argument, not a simple toggle). Order here is
-# the order they are applied in and the order admin.js renders them in --
-# keep the two lists in sync.
-ALLOWED_INSTANCE_FLAGS = ["user-study", "log", "logview", "print-all", "debug"]
 # The floor every study-code launch gets, regardless of what "flags" says --
-# admin.js renders these as checked and disabled, and _normalize_instance_flags
-# unions them back in even if a hand-edited config tries to drop them.
-# --user-study is what actually enforces the study restrictions (locks
-# notebook management, shows Submit); --log is what makes a replay of the
-# session possible at all. Losing either silently, e.g. through a malformed
-# "flags" value, would be a fail-open participant session, so a value that
-# doesn't even parse as a list is treated as choosing zero *extra* flags
-# rather than zero flags altogether.
+# admin.js renders these as locked tags, and _normalize_instance_flags unions
+# them back in even if a hand-edited config tries to drop them. --user-study
+# is what actually enforces the study restrictions (locks notebook
+# management, shows Submit); --log is what makes a replay of the session
+# possible at all. Losing either silently, e.g. through a malformed "flags"
+# value, would be a fail-open participant session, so a value that doesn't
+# even parse as a list is treated as choosing zero *extra* flags rather than
+# zero flags altogether.
 MANDATORY_INSTANCE_FLAGS = ["user-study", "log"]
 # What a study-code entry gets when it hasn't configured "flags" at all --
 # i.e. every config written before this feature existed (a bare template
@@ -1265,18 +1257,32 @@ DEFAULT_INSTANCE_FLAGS = list(MANDATORY_INSTANCE_FLAGS)
 
 
 def _normalize_instance_flags(value: object) -> list[str]:
-    """Filters `value` down to ALLOWED_INSTANCE_FLAGS, in that fixed order,
-    then unions MANDATORY_INSTANCE_FLAGS back in -- they can be added to but
-    never dropped, not even by passing [] or something that isn't a list.
+    """Sanitizes `value` into a flag list: MANDATORY_INSTANCE_FLAGS first (in
+    their fixed order, always present -- unioned in even if `value` tries to
+    drop them, or isn't a list at all), then whatever else `value` names, each
+    trimmed and stripped of leading dashes, deduplicated, in the order given.
 
-    An unrecognised name is dropped rather than raising, so a hand-edited
-    config document can never inject an arbitrary plainbook argument (e.g. a
-    stray "host=..." string)."""
-    requested: set[str] = set()
+    Deliberately NOT checked against a fixed set of known plainbook flags: an
+    admin can type any flag mux hasn't seen before and have it take effect the
+    same day, without an app.py change. That also means anything they type
+    reaches the plainbook process as `--<text>` (build_plainbook_command,
+    build_container_env) -- there is no shell involved (subprocess is invoked
+    with an argv list, never shell=True), so even an entry containing spaces
+    or other unusual characters can only ever become a single, literal argv
+    token; it cannot be split into separate arguments. A typo or an
+    unrecognised name simply makes plainbook's own argparse refuse to start,
+    it does not let extra arguments through."""
+    extras: list[str] = []
+    seen = set(MANDATORY_INSTANCE_FLAGS)
     if isinstance(value, list):
-        requested = {str(item).strip().lstrip("-") for item in value if isinstance(item, str)}
-    requested |= set(MANDATORY_INSTANCE_FLAGS)
-    return [flag for flag in ALLOWED_INSTANCE_FLAGS if flag in requested]
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            flag = item.strip().lstrip("-")
+            if flag and flag not in seen:
+                seen.add(flag)
+                extras.append(flag)
+    return list(MANDATORY_INSTANCE_FLAGS) + extras
 
 
 def get_instance_flags_for_code(launch_code: str) -> list[str]:
