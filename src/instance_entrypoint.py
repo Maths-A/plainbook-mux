@@ -11,23 +11,34 @@ from urllib.request import urlopen
 
 JSON_CONTENT_TYPE = "application/json"
 
-# Kept in sync with ALLOWED_INSTANCE_FLAGS in app.py, which is the only thing
-# that ever writes PLAINBOOK_INSTANCE_FLAGS -- this is just the matching
-# reader running inside the child container, applied defensively in case a
-# stale mux image or a hand-set env var ever sends something unexpected.
-ALLOWED_INSTANCE_FLAGS = {"user-study", "log", "logview", "print-all", "debug"}
+# Kept in sync with the constants of the same names in app.py, which is the
+# only thing that ever writes PLAINBOOK_INSTANCE_FLAGS -- this is just the
+# matching reader running inside the child container, applied defensively in
+# case a stale mux image or a hand-set env var ever sends something
+# unexpected. In particular MANDATORY_INSTANCE_FLAGS is enforced again here,
+# not only trusted from the env var: a launch with a study_code always gets
+# at least --user-study --log, even if PLAINBOOK_INSTANCE_FLAGS were somehow
+# tampered with or truncated between mux and this container.
+ALLOWED_INSTANCE_FLAGS = ["user-study", "log", "logview", "print-all", "debug"]
+MANDATORY_INSTANCE_FLAGS = {"user-study", "log"}
 
 
 def resolve_instance_flags(study_code: str) -> list[str]:
-    """The plainbook flags mux chose for this launch, from PLAINBOOK_INSTANCE_FLAGS
-    (a comma-separated list, set by app.py's build_container_env -- always
-    present, even as ""). Falls back to the pre-flag-selection default of
-    --user-study --log for a study launch when the variable is entirely
-    absent, which only happens against a mux image older than this feature."""
+    """The plainbook flags to launch with, from PLAINBOOK_INSTANCE_FLAGS (a
+    comma-separated list, set by app.py's build_container_env -- always
+    present for a mux new enough to set it, even as ""). Falls back to the
+    pre-flag-selection default of --user-study --log for a study launch when
+    the variable is entirely absent, which only happens against a mux image
+    older than this feature. A study launch always gets at least
+    MANDATORY_INSTANCE_FLAGS, regardless of what the variable said."""
     raw = os.environ.get("PLAINBOOK_INSTANCE_FLAGS")
     if raw is None:
-        return ["user-study", "log"] if study_code else []
-    return [flag for flag in (part.strip() for part in raw.split(",")) if flag in ALLOWED_INSTANCE_FLAGS]
+        chosen = {"user-study", "log"} if study_code else set()
+    else:
+        chosen = {flag.strip() for flag in raw.split(",")} & set(ALLOWED_INSTANCE_FLAGS)
+    if study_code:
+        chosen |= MANDATORY_INSTANCE_FLAGS
+    return [flag for flag in ALLOWED_INSTANCE_FLAGS if flag in chosen]
 
 
 def read_template_source(template_location: str) -> str:

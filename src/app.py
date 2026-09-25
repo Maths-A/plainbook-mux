@@ -1245,29 +1245,45 @@ def read_access_code_config_text() -> str:
 # the order they are applied in and the order admin.js renders them in --
 # keep the two lists in sync.
 ALLOWED_INSTANCE_FLAGS = ["user-study", "log", "logview", "print-all", "debug"]
-# Applied when a study-code entry is a bare template string, or a dict that
-# omits "flags" -- i.e. every config written before this feature existed.
-# Matches what every launch used to get unconditionally, so existing study
-# codes keep behaving exactly as before.
-DEFAULT_INSTANCE_FLAGS = ["user-study", "log"]
+# The floor every study-code launch gets, regardless of what "flags" says --
+# admin.js renders these as checked and disabled, and _normalize_instance_flags
+# unions them back in even if a hand-edited config tries to drop them.
+# --user-study is what actually enforces the study restrictions (locks
+# notebook management, shows Submit); --log is what makes a replay of the
+# session possible at all. Losing either silently, e.g. through a malformed
+# "flags" value, would be a fail-open participant session, so a value that
+# doesn't even parse as a list is treated as choosing zero *extra* flags
+# rather than zero flags altogether.
+MANDATORY_INSTANCE_FLAGS = ["user-study", "log"]
+# What a study-code entry gets when it hasn't configured "flags" at all --
+# i.e. every config written before this feature existed (a bare template
+# string, or a dict predating it). Happens to equal MANDATORY_INSTANCE_FLAGS,
+# since neither could be added to when everything was implicit, but the two
+# stay separate constants because they answer different questions: "what does
+# an absent field default to" vs. "what can never be removed".
+DEFAULT_INSTANCE_FLAGS = list(MANDATORY_INSTANCE_FLAGS)
 
 
 def _normalize_instance_flags(value: object) -> list[str]:
-    """Filters `value` down to ALLOWED_INSTANCE_FLAGS, in that fixed order.
+    """Filters `value` down to ALLOWED_INSTANCE_FLAGS, in that fixed order,
+    then unions MANDATORY_INSTANCE_FLAGS back in -- they can be added to but
+    never dropped, not even by passing [] or something that isn't a list.
 
-    Anything else -- an unrecognised name, a non-list value -- is dropped
-    rather than raising, so a hand-edited config document can never inject an
-    arbitrary plainbook argument (e.g. a stray "host=..." string)."""
-    if not isinstance(value, list):
-        return []
-    requested = {str(item).strip().lstrip("-") for item in value if isinstance(item, str)}
+    An unrecognised name is dropped rather than raising, so a hand-edited
+    config document can never inject an arbitrary plainbook argument (e.g. a
+    stray "host=..." string)."""
+    requested: set[str] = set()
+    if isinstance(value, list):
+        requested = {str(item).strip().lstrip("-") for item in value if isinstance(item, str)}
+    requested |= set(MANDATORY_INSTANCE_FLAGS)
     return [flag for flag in ALLOWED_INSTANCE_FLAGS if flag in requested]
 
 
 def get_instance_flags_for_code(launch_code: str) -> list[str]:
     """The plainbook flags configured for the study code `launch_code`
-    resolves to. Falls back to DEFAULT_INSTANCE_FLAGS when the entry has no
-    "flags" key (a bare template string, or a dict predating this feature)."""
+    resolves to, always including MANDATORY_INSTANCE_FLAGS. Falls back to
+    DEFAULT_INSTANCE_FLAGS when the entry has no "flags" key (a bare template
+    string, or a dict predating this feature)."""
     resolved_study_code = resolve_study_code_for_launch(launch_code)
     if not resolved_study_code:
         return list(DEFAULT_INSTANCE_FLAGS)

@@ -30,21 +30,34 @@ let studyCodes = [];
 let generatedCodeRows = [];
 
 // Plainbook flags an admin can enable per study code -- kept in sync with
-// ALLOWED_INSTANCE_FLAGS in app.py (same keys, same order). --logview is
-// included alongside the participant-facing ones because a study code can
-// also be used to host a read-only replay of an already-submitted notebook
-// (set only "logview", point the template at that notebook) rather than a
-// fresh participant session.
+// the constants of the same names in app.py (same keys, same order).
+// --logview is included alongside the participant-facing ones because a
+// study code can also be used to host a read-only replay of an
+// already-submitted notebook (set only "logview", point the template at that
+// notebook) rather than a fresh participant session.
 const INSTANCE_FLAG_OPTIONS = [
-  { key: 'user-study', label: 'User study', hint: 'Locks notebook management; shows the Submit button' },
-  { key: 'log', label: 'Log', hint: 'Records participant actions into the notebook for replay' },
+  { key: 'user-study', label: 'User study', hint: 'Locks notebook management; shows the Submit button', mandatory: true },
+  { key: 'log', label: 'Log', hint: 'Records participant actions into the notebook for replay', mandatory: true },
   { key: 'logview', label: 'Log view', hint: 'Read-only replay of an existing log; rejects all edits' },
   { key: 'print-all', label: 'Print all', hint: 'Include the navbar and panels in browser print/PDF' },
   { key: 'debug', label: 'Debug', hint: 'Verbose server-side logging' },
 ];
+// Every study code gets at least these -- rendered checked and disabled in
+// the table, and re-unioned into every row before it is saved, so neither
+// unchecking one nor hand-editing the underlying JSON can drop them.
+const MANDATORY_INSTANCE_FLAGS = INSTANCE_FLAG_OPTIONS.filter((opt) => opt.mandatory).map((opt) => opt.key);
 // What a study-code entry gets when it has no "flags" of its own -- matches
 // what every launch got unconditionally before this feature existed.
-const DEFAULT_INSTANCE_FLAGS = ['user-study', 'log'];
+const DEFAULT_INSTANCE_FLAGS = [...MANDATORY_INSTANCE_FLAGS];
+
+// Unions MANDATORY_INSTANCE_FLAGS into `flags`, ordered like
+// INSTANCE_FLAG_OPTIONS. The one place both the render path and the save
+// path route a row's flags through, so the two can never disagree about
+// which ones are locked on.
+function withMandatoryFlags(flags) {
+  const chosen = new Set([...(flags || []), ...MANDATORY_INSTANCE_FLAGS]);
+  return INSTANCE_FLAG_OPTIONS.map((opt) => opt.key).filter((key) => chosen.has(key));
+}
 
 function switchAccessModalTab(tabName) {
   const isStudy = tabName === 'study';
@@ -342,9 +355,11 @@ function renderAccessCodeRows() {
       <td>
         <div style="display:flex; flex-wrap:wrap; gap:4px 12px;">
           ${INSTANCE_FLAG_OPTIONS.map((opt) => `
-            <label style="display:inline-flex; align-items:center; gap:4px; font-weight:normal; margin:0; white-space:nowrap;" title="${escapeHtml(opt.hint)}">
-              <input type="checkbox" data-index="${index}" data-flag="${opt.key}" ${row.flags.includes(opt.key) ? 'checked' : ''}>
-              ${escapeHtml(opt.label)}
+            <label style="display:inline-flex; align-items:center; gap:4px; font-weight:normal; margin:0; white-space:nowrap; ${opt.mandatory ? 'opacity:0.65;' : ''}"
+                   title="${escapeHtml(opt.mandatory ? opt.hint + ' (always on for a study code)' : opt.hint)}">
+              <input type="checkbox" data-index="${index}" data-flag="${opt.key}"
+                     ${row.flags.includes(opt.key) ? 'checked' : ''} ${opt.mandatory ? 'disabled' : ''}>
+              ${escapeHtml(opt.label)}${opt.mandatory ? ' 🔒' : ''}
             </label>
           `).join('')}
         </div>
@@ -363,6 +378,10 @@ function renderAccessCodeRows() {
     });
   });
 
+  // A mandatory flag's checkbox is rendered `disabled`, so this listener
+  // never fires for one from a real click; withMandatoryFlags (in
+  // normalizeAccessCodeRows / saveAccessCodes) is the actual backstop against
+  // it being unset some other way.
   accessCodeRowsBody.querySelectorAll('input[data-flag]').forEach((checkbox) => {
     checkbox.addEventListener('change', (event) => {
       const idx = Number(event.target.getAttribute('data-index'));
@@ -469,11 +488,12 @@ function normalizeAccessCodeRows(rawJson) {
       }
     }
     // No "flags" key at all (a bare template string, or a dict that predates
-    // this feature): fall back to what every launch used to get, matching
-    // get_instance_flags_for_code's DEFAULT_INSTANCE_FLAGS in app.py. An
-    // explicit "flags": [] is left as-is -- that is a deliberate zero-flag
-    // launch, not a missing field.
-    return { code, template, flags: flags === null ? [...DEFAULT_INSTANCE_FLAGS] : flags };
+    // this feature): fall back to DEFAULT_INSTANCE_FLAGS, matching
+    // get_instance_flags_for_code in app.py. Either way, route through
+    // withMandatoryFlags: a present-but-incomplete "flags" list (hand-edited,
+    // or saved before this feature existed) must not render as if
+    // user-study/log had been deliberately turned off.
+    return { code, template, flags: withMandatoryFlags(flags === null ? DEFAULT_INSTANCE_FLAGS : flags) };
   }).sort((a, b) => a.code.localeCompare(b.code));
 }
 
@@ -636,13 +656,11 @@ async function saveAccessCodes() {
       return;
     }
     seenCodes.add(code);
-    // Order flags the same way ALLOWED_INSTANCE_FLAGS/INSTANCE_FLAG_OPTIONS
-    // does, rather than checkbox-click order, so the saved JSON reads the
-    // same regardless of the order boxes were ticked in.
-    const orderedFlags = INSTANCE_FLAG_OPTIONS
-      .map((opt) => opt.key)
-      .filter((key) => row.flags.includes(key));
-    configObject[code] = { template: template || null, flags: orderedFlags };
+    // withMandatoryFlags both orders flags like INSTANCE_FLAG_OPTIONS
+    // (rather than checkbox-click order) and unions user-study/log back in,
+    // so the saved JSON can never end up missing them even if row.flags
+    // somehow lost track of one.
+    configObject[code] = { template: template || null, flags: withMandatoryFlags(row.flags) };
   }
 
   if (!Object.keys(configObject).length) {
