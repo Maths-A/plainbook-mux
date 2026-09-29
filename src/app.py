@@ -137,7 +137,11 @@ LAUNCH_CODE_RECENT_STOP_GRACE_SECONDS = read_env_int("PLAINBOOK_LAUNCH_CODE_RECE
 PLAINBOOK_UPLOAD_KEY_FILE = os.environ.get("PLAINBOOK_UPLOAD_KEY_FILE", "").strip()
 GCS_STUDY_BUCKET = os.environ.get("GCS_STUDY_BUCKET", "").strip()
 PLAINBOOK_UPLOAD_KEY_JSON = os.environ.get("PLAINBOOK_UPLOAD_KEY_JSON", "").strip()
-DEFAULT_GEMINI_API_KEY = os.environ.get("PLAINBOOK_DEFAULT_GEMINI_API_KEY", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()
+# The API key auto-filled into every launched instance, so a participant never
+# sees a Settings screen asking for one. Claude, not Gemini: the study runs on
+# Claude, so this is the only provider key that gets auto-filled -- change
+# this (and the CLAUDE_API_KEY assignments below) together if that changes.
+DEFAULT_CLAUDE_API_KEY = os.environ.get("PLAINBOOK_DEFAULT_CLAUDE_API_KEY", "").strip() or os.environ.get("CLAUDE_API_KEY", "").strip()
 ACCESS_CODE_GCS_BUCKET = os.environ.get("PLAINBOOK_ACCESS_CODE_GCS_BUCKET", "").strip() or GCS_STUDY_BUCKET
 ACCESS_CODE_GCS_PREFIX = os.environ.get("PLAINBOOK_ACCESS_CODE_GCS_PREFIX", "plainbook/user-studies/config").strip().strip("/")
 if not PLAINBOOK_UPLOAD_KEY_JSON and PLAINBOOK_UPLOAD_KEY_FILE:
@@ -278,8 +282,8 @@ def build_instance_env(
     submission_key = (launch_code or "").strip() or instance_dir.name
     env["PLAINBOOK_CONTAINER_INSTANCE_ID"] = submission_key
     env["PLAINBOOK_RUNTIME_INSTANCE_ID"] = instance_dir.name
-    if DEFAULT_GEMINI_API_KEY:
-      env["GEMINI_API_KEY"] = DEFAULT_GEMINI_API_KEY
+    if DEFAULT_CLAUDE_API_KEY:
+      env["CLAUDE_API_KEY"] = DEFAULT_CLAUDE_API_KEY
     if study_code:
       env["PLAINBOOK_STUDY_CODE"] = study_code
       if GCS_STUDY_BUCKET:
@@ -608,8 +612,8 @@ def build_container_env(
         # falls back on for --user-study/--log via the study_code default.
         "PLAINBOOK_INSTANCE_FLAGS": ",".join(flags or []),
     }
-    if DEFAULT_GEMINI_API_KEY:
-      env["GEMINI_API_KEY"] = DEFAULT_GEMINI_API_KEY
+    if DEFAULT_CLAUDE_API_KEY:
+      env["CLAUDE_API_KEY"] = DEFAULT_CLAUDE_API_KEY
     if template_location:
       env["PLAINBOOK_TEMPLATE_LOCATION"] = template_location
     if study_code:
