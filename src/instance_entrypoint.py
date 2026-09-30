@@ -157,6 +157,21 @@ def restore_submitted_notebook(notebook_path: Path, study_code: str, submission_
     return write_notebook_if_valid(notebook_path, notebook_raw)
 
 
+def _bundle_has_report_activity_route(plainbook_main_module) -> bool:
+    """Whether the bundled plainbook package already registers its own
+    /report_activity route. True means it also has the client-side JS ping
+    (mouse/keyboard/click events) that calls it -- the two shipped together
+    -- so neither of this module's fallbacks (the route itself, and the
+    broader per-request hook below) are needed or wanted."""
+    try:
+        routes = getattr(plainbook_main_module.default_app(), "routes", [])
+        return any(getattr(route, "rule", "") == "/report_activity" for route in routes)
+    except Exception:
+        # If route inspection fails, assume the worst and let both fallbacks
+        # install rather than silently leave activity unreported.
+        return False
+
+
 def _register_fallback_activity_route(plainbook_main_module) -> None:
     """Register /report_activity if the bundled plainbook package does not already expose it."""
     try:
@@ -164,13 +179,8 @@ def _register_fallback_activity_route(plainbook_main_module) -> None:
     except Exception:
         return
 
-    try:
-        routes = getattr(plainbook_main_module.default_app(), "routes", [])
-        if any(getattr(route, "rule", "") == "/report_activity" for route in routes):
-            return
-    except Exception:
-        # If route inspection fails, fall back to registering the route.
-        pass
+    if _bundle_has_report_activity_route(plainbook_main_module):
+        return
 
     @post("/report_activity")
     def report_activity():
@@ -198,8 +208,24 @@ def _register_activity_request_hook(plainbook_main_module) -> None:
     """Report activity from authenticated notebook API traffic.
 
     This is a fallback for stale frontend bundles that may not emit
-    `/report_activity` pings from browser events yet.
+    `/report_activity` pings from browser events yet -- a no-op when the
+    bundled plainbook already has its own /report_activity route, since that
+    means the modern client-side ping (real mouse/keyboard/click events) is
+    present too, and this blanket per-request hook is then not just
+    redundant but a liability: it treats ANY authenticated request as
+    "activity", with no way to tell a participant's own traffic from
+    something else hitting the same URL with a valid token for other
+    reasons -- an admin, a script, or mux's own health checks
+    (list_instances, called from /api/sessions and /api/instance-status)
+    targets the instance root with one already, which happens to be exempt
+    via ignored_exact below, but nothing stopped a differently-targeted probe
+    from counting. Those all carry X-Plainbook-Probe precisely so they can be
+    told apart from a participant's own traffic; this hook honors that below
+    regardless, as defense in depth for whatever genuinely stale bundle it is
+    still guarding.
     """
+    if _bundle_has_report_activity_route(plainbook_main_module):
+        return
     try:
         from bottle import request
     except Exception:
@@ -250,6 +276,11 @@ def _register_activity_request_hook(plainbook_main_module) -> None:
             if not path or path in ignored_exact:
                 return
             if any(path.startswith(prefix) for prefix in ignored_prefixes):
+                return
+            # mux's own health/readiness probing (list_instances,
+            # wait_for_backend_ready) marks itself with this header
+            # specifically so it is never mistaken for real activity.
+            if request.headers.get("X-Plainbook-Probe"):
                 return
             if not _has_valid_token():
                 return
